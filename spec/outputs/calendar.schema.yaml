@@ -1,0 +1,13 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$ref: '#/$defs/yamlValue'
+$defs:
+  yamlValue:
+    oneOf:
+      - type: object
+        additionalProperties: true
+      - type: array
+      - type: string
+      - type: number
+      - type: integer
+      - type: boolean
+      - type: 'null'
