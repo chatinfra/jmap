@@ -147,11 +147,16 @@ type Event struct {
 	Title                  string           `json:"title,omitempty"`
 	Description            string           `json:"description,omitempty"`
 	DescriptionContentType string           `json:"descriptionContentType,omitempty"`
+	Location               string           `json:"location,omitempty"`
+	Locations              map[string]any   `json:"locations,omitempty"`
+	Participants           map[string]any   `json:"participants,omitempty"`
 	CalendarIDs            map[string]bool  `json:"calendarIds,omitempty"`
 	UTCStart               string           `json:"utcStart,omitempty"`
 	Start                  string           `json:"start,omitempty"`
 	TimeZone               string           `json:"timeZone,omitempty"`
 	Duration               string           `json:"duration,omitempty"`
+	ICalendar              string           `json:"iCalendar,omitempty"`
+	ICalendarLower         string           `json:"icalendar,omitempty"`
 	Created                string           `json:"created,omitempty"`
 	Updated                string           `json:"updated,omitempty"`
 	FreeBusyStatus         string           `json:"freeBusyStatus,omitempty"`
