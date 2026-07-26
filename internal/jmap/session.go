@@ -129,10 +129,15 @@ func (c *Client) sessionEndpointCandidates() []string {
 	if strings.HasSuffix(base, "/.well-known/jmap") || strings.HasSuffix(base, "/jmap/session") || strings.HasSuffix(base, "/session") {
 		candidates = append(candidates, base)
 	} else {
-		candidates = append(candidates, base+"/.well-known/jmap")
 		if strings.HasSuffix(base, "/jmap") {
+			root := strings.TrimRight(strings.TrimSuffix(base, "/jmap"), "/")
+			if root != "" {
+				candidates = append(candidates, root+"/.well-known/jmap")
+			}
+			candidates = append(candidates, base+"/.well-known/jmap")
 			candidates = append(candidates, base+"/session")
 		} else {
+			candidates = append(candidates, base+"/.well-known/jmap")
 			candidates = append(candidates, base+"/jmap/session")
 			candidates = append(candidates, base+"/session")
 		}

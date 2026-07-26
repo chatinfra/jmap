@@ -54,12 +54,33 @@ type HTTPError struct {
 	Body       string
 }
 
+type DecodeError struct {
+	Method string
+	Path   string
+	Body   string
+	Err    error
+}
+
 func (e *HTTPError) Error() string {
 	message := fmt.Sprintf("opencode request failed: %s %s: %s", e.Method, e.Path, e.Status)
 	if e.Body != "" {
 		message += ": " + e.Body
 	}
 	return message
+}
+
+func (e *DecodeError) Error() string {
+	if e == nil || e.Err == nil {
+		return "decode opencode response"
+	}
+	return fmt.Sprintf("decode opencode response: %v", e.Err)
+}
+
+func (e *DecodeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 type StaleSessionError struct {
@@ -116,22 +137,24 @@ func (c *Client) CreateSession(ctx context.Context) (Session, error) {
 	if c.agent != "" {
 		body["agent"] = c.agent
 	}
-	data, err := c.doJSON(ctx, http.MethodPost, "/api/session", body)
+	data, err := c.doJSON(ctx, http.MethodPost, "/session", body)
 	if err != nil {
-		if !shouldFallbackCreateSession(err) {
-			return Session{}, err
-		}
-		data, err = c.doJSON(ctx, http.MethodPost, "/session", body)
-		if err != nil {
-			if !shouldRetrySessionWithoutDirectory(err) {
-				return Session{}, err
-			}
+		if shouldRetrySessionWithoutDirectory(err) {
 			fallback, fallbackErr := c.doJSONWithDirectory(ctx, http.MethodPost, "/session", body, false)
-			if fallbackErr != nil {
+			if fallbackErr == nil {
+				c.disableDirectoryQuery()
+				data = fallback
+			} else {
 				return Session{}, fmt.Errorf("%w (retry without directory failed: %v)", err, fallbackErr)
 			}
-			c.disableDirectoryQuery()
-			data = fallback
+		} else {
+			if !shouldFallbackCreateSession(err) {
+				return Session{}, err
+			}
+			data, err = c.doJSON(ctx, http.MethodPost, "/api/session", body)
+			if err != nil {
+				return Session{}, err
+			}
 		}
 	}
 	id, ok := firstString(data, "id", "sessionID")
@@ -155,11 +178,18 @@ func (c *Client) SubmitPrompt(ctx context.Context, sessionID, text string) error
 	if text == "" {
 		return errors.New("opencode prompt text is required")
 	}
+	if err := c.submitLegacyPrompt(ctx, sessionID, text); err == nil {
+		return nil
+	} else if IsStaleSession(err) {
+		return err
+	} else if !shouldFallbackPrompt(err) {
+		return err
+	}
 	message := map[string]any{
 		"prompt": map[string]any{
 			"text": text,
 		},
-		"delivery": "immediate",
+		"delivery": "steer",
 	}
 	if c.agent != "" {
 		message["prompt"].(map[string]any)["agents"] = []map[string]string{{"name": c.agent}}
@@ -172,7 +202,7 @@ func (c *Client) SubmitPrompt(ctx context.Context, sessionID, text string) error
 		if !shouldFallbackPrompt(err) {
 			return err
 		}
-		return c.submitLegacyPrompt(ctx, sessionID, text)
+		return err
 	}
 	return nil
 }
@@ -219,8 +249,19 @@ type SSEEvent struct {
 }
 
 func (c *Client) Subscribe(ctx context.Context) (<-chan SSEEvent, <-chan error, func(), error) {
+	events, errs, stop, err := c.subscribe(ctx, "/global/event")
+	if err == nil {
+		return events, errs, stop, nil
+	}
+	if !shouldFallbackEventStream(err) {
+		return nil, nil, func() {}, err
+	}
+	return c.subscribe(ctx, "/event")
+}
+
+func (c *Client) subscribe(ctx context.Context, path string) (<-chan SSEEvent, <-chan error, func(), error) {
 	streamCtx, cancel := context.WithCancel(ctx)
-	target := c.buildURL("/event")
+	target := c.buildURL(path)
 	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, target, nil)
 	if err != nil {
 		cancel()
@@ -328,7 +369,7 @@ func (c *Client) doJSONWithDirectory(ctx context.Context, method, path string, b
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(respBody, &decoded); err != nil {
-		return nil, fmt.Errorf("decode opencode response: %w", err)
+		return nil, &DecodeError{Method: req.Method, Path: requestPath(req.URL), Body: compactBody(respBody), Err: err}
 	}
 	return decoded, nil
 }
@@ -403,12 +444,39 @@ func compactBody(body []byte) string {
 
 func shouldFallbackCreateSession(err error) bool {
 	var httpErr *HTTPError
-	return errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusMethodNotAllowed)
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusMethodNotAllowed
+	}
+	var decodeErr *DecodeError
+	return errors.As(err, &decodeErr)
 }
 
 func shouldFallbackPrompt(err error) bool {
 	var httpErr *HTTPError
-	return errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusMethodNotAllowed)
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusNotFound ||
+			httpErr.StatusCode == http.StatusMethodNotAllowed ||
+			isV2SessionPromptUnavailable(httpErr)
+	}
+	var decodeErr *DecodeError
+	return errors.As(err, &decodeErr)
+}
+
+func shouldFallbackEventStream(err error) bool {
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusMethodNotAllowed
+	}
+	return false
+}
+
+func isV2SessionPromptUnavailable(err *HTTPError) bool {
+	if err == nil || err.StatusCode != http.StatusServiceUnavailable {
+		return false
+	}
+	body := strings.ToLower(err.Body)
+	return strings.Contains(body, "v2.session.prompt") ||
+		strings.Contains(body, "v2 session prompt is not available")
 }
 
 func shouldRetrySessionWithoutDirectory(err error) bool {

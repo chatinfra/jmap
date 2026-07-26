@@ -132,12 +132,45 @@ type Calendar struct {
 	Name                  string         `json:"name,omitempty"`
 	Description           string         `json:"description,omitempty"`
 	SortOrder             int            `json:"sortOrder,omitempty"`
-	IsVisible             bool           `json:"isVisible,omitempty"`
-	IsSubscribed          bool           `json:"isSubscribed,omitempty"`
-	IncludeInAvailability bool           `json:"includeInAvailability,omitempty"`
+	IsVisible             FlexibleBool   `json:"isVisible,omitempty"`
+	IsSubscribed          FlexibleBool   `json:"isSubscribed,omitempty"`
+	IncludeInAvailability FlexibleBool   `json:"includeInAvailability,omitempty"`
 	TimeZone              string         `json:"timeZone,omitempty"`
 	MyRights              map[string]any `json:"myRights,omitempty"`
 	ShareWith             map[string]any `json:"shareWith,omitempty"`
+}
+
+type FlexibleBool bool
+
+func (b *FlexibleBool) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*b = false
+		return nil
+	}
+	var boolValue bool
+	if err := json.Unmarshal(data, &boolValue); err == nil {
+		*b = FlexibleBool(boolValue)
+		return nil
+	}
+	var stringValue string
+	if err := json.Unmarshal(data, &stringValue); err == nil {
+		switch strings.ToLower(strings.TrimSpace(stringValue)) {
+		case "1", "true", "t", "yes", "y", "on":
+			*b = true
+		case "", "0", "false", "f", "no", "n", "off":
+			*b = false
+		default:
+			*b = false
+		}
+		return nil
+	}
+	var numberValue float64
+	if err := json.Unmarshal(data, &numberValue); err == nil {
+		*b = numberValue != 0
+		return nil
+	}
+	return fmt.Errorf("invalid flexible bool %s", trimmed)
 }
 
 type Event struct {

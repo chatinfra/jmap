@@ -19,14 +19,33 @@ type EventsFile struct {
 	Snapshot jmap.CalendarSnapshot `json:"snapshot"`
 }
 
+// ContactsFile persists the tenant's shared contact records that the contact
+// directory has loaded, so the agent-facing directory stays warm across
+// restarts. It is a read-model cache, not a source of truth.
+type ContactsFile struct {
+	Contacts    []jmap.Contact `json:"contacts"`
+	RefreshedAt time.Time      `json:"refreshedAt"`
+}
+
+// MessagesFile persists the set of inbound message IDs the email listener has
+// already observed. Initialized distinguishes a first-ever start (baseline the
+// existing inbox without submitting) from a restart with a persisted set.
+type MessagesFile struct {
+	Initialized bool     `json:"initialized"`
+	SeenIDs     []string `json:"seenIds"`
+}
+
 type StatusFile struct {
 	JMAPConnected          bool       `json:"jmapConnected"`
 	PushState              string     `json:"pushState"`
 	LastSnapshotRefreshAt  *time.Time `json:"lastSnapshotRefreshAt,omitempty"`
 	LastVALARMFiredAt      *time.Time `json:"lastValarmFiredAt,omitempty"`
+	LastEmailReceivedAt    *time.Time `json:"lastEmailReceivedAt,omitempty"`
+	LastContactRefreshAt   *time.Time `json:"lastContactRefreshAt,omitempty"`
 	LastPromptCompletedAt  *time.Time `json:"lastPromptCompletedAt,omitempty"`
 	LastError              string     `json:"lastError,omitempty"`
 	CalendarSessionCount   int        `json:"calendarSessionCount"`
+	MailSessionCount       int        `json:"mailSessionCount"`
 	DaemonStartedAt        time.Time  `json:"daemonStartedAt"`
 	RegisteredListenerKeys []string   `json:"registeredListenerKeys,omitempty"`
 }
@@ -92,6 +111,46 @@ func (s *StateStore) SaveEvents(snapshot jmap.CalendarSnapshot) error {
 	return s.writeJSONAtomic("events.json", EventsFile{Snapshot: snapshot}, 0o600)
 }
 
+func (s *StateStore) LoadContacts() (ContactsFile, error) {
+	path := filepath.Join(s.dir, "contacts.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ContactsFile{}, nil
+		}
+		return ContactsFile{}, err
+	}
+	var file ContactsFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return ContactsFile{}, err
+	}
+	return file, nil
+}
+
+func (s *StateStore) SaveContacts(file ContactsFile) error {
+	return s.writeJSONAtomic("contacts.json", file, 0o600)
+}
+
+func (s *StateStore) LoadMessages() (MessagesFile, error) {
+	path := filepath.Join(s.dir, "messages.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return MessagesFile{}, nil
+		}
+		return MessagesFile{}, err
+	}
+	var file MessagesFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return MessagesFile{}, err
+	}
+	return file, nil
+}
+
+func (s *StateStore) SaveMessages(file MessagesFile) error {
+	return s.writeJSONAtomic("messages.json", file, 0o600)
+}
+
 func (s *StateStore) SaveStatus(status StatusFile) error {
 	return s.writeJSONAtomic("status.json", status, 0o644)
 }
@@ -106,18 +165,32 @@ func (s *StateStore) writeJSONAtomic(name string, value any, perm os.FileMode) e
 	}
 	data = append(data, '\n')
 	path := filepath.Join(s.dir, name)
-	tmp := filepath.Join(s.dir, fmt.Sprintf(".%s.%d.tmp", name, os.Getpid()))
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	tmpFile, err := os.CreateTemp(s.dir, fmt.Sprintf(".%s.*.tmp", name))
+	if err != nil {
 		return err
 	}
-	if err := os.Chmod(tmp, perm); err != nil {
-		_ = os.Remove(tmp)
+	tmp := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Chmod(perm); err != nil {
+		_ = tmpFile.Close()
 		return fmt.Errorf("chmod %s: %w", tmp, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := tmpFile.Close(); err != nil {
 		return err
 	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	cleanupTmp = false
 	if err := os.Chmod(path, perm); err != nil {
 		return fmt.Errorf("chmod %s: %w", path, err)
 	}

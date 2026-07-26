@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 var (
 	sessionRetryInitialDelay = time.Second
 	sessionRetryMaxElapsed   = 2 * time.Minute
+	errJMAPPushChannelClosed = errors.New("JMAP push channel closed")
 )
 
 type calendarClient interface {
@@ -36,6 +36,8 @@ type Bridge struct {
 	jmap     calendarClient
 	opencode opencodeClient
 	store    *StateStore
+	mail     *emailListener
+	contacts *contactDirectory
 
 	mu       sync.Mutex
 	sessions map[string]string
@@ -47,9 +49,17 @@ type Bridge struct {
 	wg       sync.WaitGroup
 }
 
+// submission is one unit of work for a session worker: the opencode session key
+// (a calendarId for the calendar listener, or a mail-namespaced key for the
+// email listener) and the plain-text prompt to submit.
+type submission struct {
+	sessionKey string
+	prompt     string
+}
+
 type sessionWorker struct {
-	calendarID string
-	ch         chan jmap.AlarmOccurrence
+	sessionKey string
+	ch         chan submission
 }
 
 func NewBridge(cfg Config, logger *log.Logger) (*Bridge, error) {
@@ -72,7 +82,7 @@ func NewBridgeWithClients(cfg Config, logger *log.Logger, jmapClient calendarCli
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Bridge{
+	b := &Bridge{
 		cfg:      cfg,
 		logger:   logger,
 		jmap:     jmapClient,
@@ -80,10 +90,21 @@ func NewBridgeWithClients(cfg Config, logger *log.Logger, jmapClient calendarCli
 		store:    NewStateStore(cfg.StateDir),
 		workers:  map[string]*sessionWorker{},
 		status: StatusFile{
-			DaemonStartedAt:        time.Now().UTC(),
-			RegisteredListenerKeys: calendarListenerKeys(),
+			DaemonStartedAt: time.Now().UTC(),
 		},
 	}
+	// The calendar VALARM listener is always active. The email and contact
+	// modules attach whenever the JMAP client exposes the corresponding
+	// provider operations (the real client always does); narrow test clients
+	// that implement only the calendar interface leave them unwired.
+	if source, ok := jmapClient.(contactSource); ok {
+		b.contacts = newContactDirectory(source, b.store, logger, b.markContactRefreshed)
+	}
+	if source, ok := jmapClient.(mailSource); ok {
+		b.mail = newEmailListener(source, b.contacts, b.store, logger, b.submitEmail)
+	}
+	b.status.RegisteredListenerKeys = b.registeredListenerKeys()
+	return b
 }
 
 func (b *Bridge) Run(ctx context.Context) error {
@@ -95,10 +116,22 @@ func (b *Bridge) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load events: %w", err)
 	}
+	if b.contacts != nil {
+		if err := b.contacts.Load(); err != nil {
+			return fmt.Errorf("load contacts: %w", err)
+		}
+	}
+	if b.mail != nil {
+		if err := b.mail.Load(); err != nil {
+			return fmt.Errorf("load messages: %w", err)
+		}
+	}
+	calendarSessions, mailSessions := sessionCounts(sessions)
 	b.mu.Lock()
 	b.runCtx = ctx
 	b.sessions = sessions
-	b.status.CalendarSessionCount = len(sessions)
+	b.status.CalendarSessionCount = calendarSessions
+	b.status.MailSessionCount = mailSessions
 	b.snapshot = persistedSnapshot
 	b.mu.Unlock()
 	b.flushStatus()
@@ -129,7 +162,15 @@ func (b *Bridge) Run(ctx context.Context) error {
 	}
 	if pushAvailable {
 		b.setPushState("eventsource")
-		return b.runPush(ctx)
+		if err := b.runPush(ctx); err != nil {
+			if ctx.Err() == nil {
+				b.logger.Printf("JMAP push unavailable (%v); falling back to polling every %s", err, b.cfg.PollInterval)
+				b.setPushState("polling")
+				return b.runPolling(ctx)
+			}
+			return err
+		}
+		return nil
 	}
 	b.setPushState("polling")
 	return b.runPolling(ctx)
@@ -157,9 +198,8 @@ func (b *Bridge) runPush(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return nil
 				}
-				err := errors.New("JMAP push channel closed")
-				b.recordError(err)
-				return err
+				b.recordError(errJMAPPushChannelClosed)
+				return errJMAPPushChannelClosed
 			}
 			if err := b.refresh(ctx); err != nil {
 				b.recordError(fmt.Errorf("jmap refresh: %w", err))
@@ -199,7 +239,26 @@ func (b *Bridge) refresh(ctx context.Context) error {
 	}
 	b.flushStatus()
 	b.scheduleSnapshot(snapshot)
+	b.refreshModules(ctx)
 	return nil
+}
+
+// refreshModules drives the non-calendar listener modules on the same refresh
+// cadence as the calendar snapshot (push notification or polling tick). A
+// module error is log-only so a transient mail or contact failure never tears
+// down the calendar listener or the daemon. Contacts refresh first so the
+// directory is warm when the email listener resolves senders.
+func (b *Bridge) refreshModules(ctx context.Context) {
+	if b.contacts != nil {
+		if err := b.contacts.Refresh(ctx); err != nil {
+			b.logOnlyError("contact directory refresh", err)
+		}
+	}
+	if b.mail != nil {
+		if err := b.mail.Refresh(ctx); err != nil {
+			b.logOnlyError("email listener refresh", err)
+		}
+	}
 }
 
 func (b *Bridge) scheduleSnapshot(snapshot jmap.CalendarSnapshot) {
@@ -241,21 +300,51 @@ func (b *Bridge) enqueueAlarm(alarm jmap.AlarmOccurrence) {
 	b.status.LastVALARMFiredAt = &now
 	b.mu.Unlock()
 	b.flushStatus()
-	worker := b.workerFor(alarm.CalendarID)
+	b.enqueue(submission{sessionKey: alarm.CalendarID, prompt: FormatPrompt(alarm)})
+}
+
+// submitEmail is the email listener's hook into the shared prompt submitter: it
+// records the inbound-mail timestamp and enqueues the message prompt onto the
+// mailbox's session worker so mail prompts serialize within one mail session.
+func (b *Bridge) submitEmail(sessionKey, prompt string, receivedAt time.Time) {
+	if receivedAt.IsZero() {
+		receivedAt = time.Now().UTC()
+	}
+	b.mu.Lock()
+	b.status.LastEmailReceivedAt = &receivedAt
+	b.mu.Unlock()
+	b.flushStatus()
+	b.enqueue(submission{sessionKey: sessionKey, prompt: prompt})
+}
+
+// markContactRefreshed records the last time the contact directory reloaded the
+// tenant's shared contact records.
+func (b *Bridge) markContactRefreshed(at time.Time) {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	b.mu.Lock()
+	b.status.LastContactRefreshAt = &at
+	b.mu.Unlock()
+	b.flushStatus()
+}
+
+func (b *Bridge) enqueue(sub submission) {
+	worker := b.workerFor(sub.sessionKey)
 	select {
-	case worker.ch <- alarm:
+	case worker.ch <- sub:
 	case <-b.runContext().Done():
 	}
 }
 
-func (b *Bridge) workerFor(calendarID string) *sessionWorker {
+func (b *Bridge) workerFor(sessionKey string) *sessionWorker {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if worker := b.workers[calendarID]; worker != nil {
+	if worker := b.workers[sessionKey]; worker != nil {
 		return worker
 	}
-	worker := &sessionWorker{calendarID: calendarID, ch: make(chan jmap.AlarmOccurrence, 64)}
-	b.workers[calendarID] = worker
+	worker := &sessionWorker{sessionKey: sessionKey, ch: make(chan submission, 64)}
+	b.workers[sessionKey] = worker
 	b.wg.Add(1)
 	ctx := b.runCtx
 	if ctx == nil {
@@ -271,28 +360,27 @@ func (b *Bridge) runWorker(ctx context.Context, worker *sessionWorker) {
 		select {
 		case <-ctx.Done():
 			return
-		case alarm, ok := <-worker.ch:
+		case sub, ok := <-worker.ch:
 			if !ok {
 				return
 			}
-			b.processAlarm(ctx, alarm)
+			b.processSubmission(ctx, sub)
 		}
 	}
 }
 
-func (b *Bridge) processAlarm(ctx context.Context, alarm jmap.AlarmOccurrence) {
-	sessionID, err := b.sessionForWithRetry(ctx, alarm.CalendarID)
+func (b *Bridge) processSubmission(ctx context.Context, sub submission) {
+	sessionID, err := b.sessionForWithRetry(ctx, sub.sessionKey)
 	if err != nil {
 		b.logOnlyError("create opencode session", err)
 		return
 	}
-	prompt := FormatPrompt(alarm)
-	_, err = b.opencode.Prompt(ctx, sessionID, prompt)
+	_, err = b.opencode.Prompt(ctx, sessionID, sub.prompt)
 	if opencode.IsStaleSession(err) {
-		b.logger.Printf("recreating stale opencode session calendar_id=%s", alarm.CalendarID)
-		sessionID, err = b.recreateSession(ctx, alarm.CalendarID)
+		b.logger.Printf("recreating stale opencode session session_key=%s", sub.sessionKey)
+		sessionID, err = b.recreateSession(ctx, sub.sessionKey)
 		if err == nil {
-			_, err = b.opencode.Prompt(ctx, sessionID, prompt)
+			_, err = b.opencode.Prompt(ctx, sessionID, sub.prompt)
 		}
 	}
 	if err != nil {
@@ -306,30 +394,30 @@ func (b *Bridge) processAlarm(ctx context.Context, alarm jmap.AlarmOccurrence) {
 	b.flushStatus()
 }
 
-func (b *Bridge) sessionFor(ctx context.Context, calendarID string) (string, error) {
+func (b *Bridge) sessionFor(ctx context.Context, sessionKey string) (string, error) {
 	b.mu.Lock()
-	sessionID := b.sessions[calendarID]
+	sessionID := b.sessions[sessionKey]
 	b.mu.Unlock()
 	if sessionID != "" {
 		return sessionID, nil
 	}
-	return b.recreateSession(ctx, calendarID)
+	return b.recreateSession(ctx, sessionKey)
 }
 
-func (b *Bridge) sessionForWithRetry(ctx context.Context, calendarID string) (string, error) {
+func (b *Bridge) sessionForWithRetry(ctx context.Context, sessionKey string) (string, error) {
 	startedAt := time.Now()
 	delay := sessionRetryInitialDelay
 	attempt := 0
 	for {
 		attempt++
-		sessionID, err := b.sessionFor(ctx, calendarID)
+		sessionID, err := b.sessionFor(ctx, sessionKey)
 		if err == nil {
 			return sessionID, nil
 		}
 		if !opencode.IsRetryable(err) || time.Since(startedAt) >= sessionRetryMaxElapsed {
 			return "", err
 		}
-		b.logger.Printf("create session transient failure calendar_id=%s attempt=%d retry_in=%s: %v", calendarID, attempt, delay, err)
+		b.logger.Printf("create session transient failure session_key=%s attempt=%d retry_in=%s: %v", sessionKey, attempt, delay, err)
 		b.recordError(err)
 		select {
 		case <-ctx.Done():
@@ -345,7 +433,7 @@ func (b *Bridge) sessionForWithRetry(ctx context.Context, calendarID string) (st
 	}
 }
 
-func (b *Bridge) recreateSession(ctx context.Context, calendarID string) (string, error) {
+func (b *Bridge) recreateSession(ctx context.Context, sessionKey string) (string, error) {
 	session, err := b.opencode.CreateSession(ctx)
 	if err != nil {
 		return "", err
@@ -354,8 +442,10 @@ func (b *Bridge) recreateSession(ctx context.Context, calendarID string) (string
 	if b.sessions == nil {
 		b.sessions = map[string]string{}
 	}
-	b.sessions[calendarID] = session.ID
-	b.status.CalendarSessionCount = len(b.sessions)
+	b.sessions[sessionKey] = session.ID
+	calendarSessions, mailSessions := sessionCounts(b.sessions)
+	b.status.CalendarSessionCount = calendarSessions
+	b.status.MailSessionCount = mailSessions
 	b.mu.Unlock()
 	if err := b.flushSessions(); err != nil {
 		return "", err
@@ -465,20 +555,53 @@ func calendarListenerDataTypes() []string { return []string{"Calendar", "Calenda
 
 func calendarListenerKeys() []string { return []string{"calendar-valarm"} }
 
-func registeredListenerKeys() []string { return calendarListenerKeys() }
+func emailListenerKeys() []string { return []string{"email-inbox"} }
 
-func registeredSubscriptionDataTypes() []string { return calendarListenerDataTypes() }
+func contactListenerKeys() []string { return []string{"contact-directory"} }
 
-func hasOnlyCalendarListener() bool {
-	keys := registeredListenerKeys()
-	return len(keys) == 1 && keys[0] == "calendar-valarm" && !containsString(registeredSubscriptionDataTypes(), "Email") && !containsString(registeredSubscriptionDataTypes(), "ContactCard")
+// registeredListenerKeys reports the listener modules active on this bridge.
+// The calendar VALARM listener is always active; the email and contact modules
+// are reported when they are wired (the real client always wires them).
+func (b *Bridge) registeredListenerKeys() []string {
+	keys := calendarListenerKeys()
+	if b.mail != nil {
+		keys = append(keys, emailListenerKeys()...)
+	}
+	if b.contacts != nil {
+		keys = append(keys, contactListenerKeys()...)
+	}
+	return keys
 }
 
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if strings.EqualFold(value, want) {
-			return true
-		}
+// subscriptionDataTypes reports the JMAP data types this bridge subscribes to
+// across its active listener modules.
+func (b *Bridge) subscriptionDataTypes() []string {
+	types := calendarListenerDataTypes()
+	if b.mail != nil {
+		types = append(types, "Email")
 	}
-	return false
+	if b.contacts != nil {
+		types = append(types, "ContactCard")
+	}
+	return types
+}
+
+// allSubscriptionDataTypes is the full set of JMAP data types the daemon's
+// listener modules consume. The real JMAP client subscribes to this set so a
+// change to any active data type refreshes the corresponding module.
+func allSubscriptionDataTypes() []string {
+	return []string{"Calendar", "CalendarEvent", "Email", "ContactCard"}
+}
+
+// sessionCounts partitions the persisted session map into per-calendar and
+// per-mailbox session counts for status reporting.
+func sessionCounts(sessions map[string]string) (calendar, mail int) {
+	for key := range sessions {
+		if isMailSessionKey(key) {
+			mail++
+			continue
+		}
+		calendar++
+	}
+	return calendar, mail
 }

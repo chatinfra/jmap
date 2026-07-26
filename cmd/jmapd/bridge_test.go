@@ -228,10 +228,56 @@ func TestBridgeContextShutdownFlushesStateAndFatalJMAPErrorReturns(t *testing.T)
 	}
 }
 
-func TestOnlyCalendarListenerIsRegistered(t *testing.T) {
-	if !hasOnlyCalendarListener() {
-		t.Fatalf("listeners=%v dataTypes=%v", registeredListenerKeys(), registeredSubscriptionDataTypes())
+func TestBridgeFallsBackToPollingWhenAdvertisedPushCloses(t *testing.T) {
+	stateDir := t.TempDir()
+	j := &fakeCalendarClient{snapshot: testSnapshot(), push: true, closePushImmediately: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- testBridge(stateDir, j, newFakeOpencode()).Run(ctx) }()
+
+	waitForStatus(t, filepath.Join(stateDir, "status.json"), func(status StatusFile) bool {
+		return status.JMAPConnected && status.PushState == "polling" && status.LastError == errJMAPPushChannelClosed.Error()
+	})
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatal(err)
 	}
+}
+
+func TestCalendarEmailAndContactListenersAreRegistered(t *testing.T) {
+	bridge := testBridgeWithModules(t.TempDir(), newFakeJMAPClient(), newFakeOpencode())
+	keys := bridge.registeredListenerKeys()
+	for _, want := range []string{"calendar-valarm", "email-inbox", "contact-directory"} {
+		if !containsTestString(keys, want) {
+			t.Fatalf("registered listener keys=%v missing %q", keys, want)
+		}
+	}
+	types := bridge.subscriptionDataTypes()
+	for _, want := range []string{"Calendar", "CalendarEvent", "Email", "ContactCard"} {
+		if !containsTestString(types, want) {
+			t.Fatalf("subscription data types=%v missing %q", types, want)
+		}
+	}
+	if !containsTestString(allSubscriptionDataTypes(), "Email") || !containsTestString(allSubscriptionDataTypes(), "ContactCard") {
+		t.Fatalf("allSubscriptionDataTypes=%v must include Email and ContactCard", allSubscriptionDataTypes())
+	}
+}
+
+func TestNarrowCalendarClientRegistersOnlyCalendarListener(t *testing.T) {
+	bridge := testBridge(t.TempDir(), &fakeCalendarClient{}, newFakeOpencode())
+	keys := bridge.registeredListenerKeys()
+	if len(keys) != 1 || keys[0] != "calendar-valarm" {
+		t.Fatalf("expected only the calendar listener for a narrow client, got %v", keys)
+	}
+}
+
+func containsTestString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func testBridge(stateDir string, j *fakeCalendarClient, oc *fakeOpencode) *Bridge {
@@ -254,10 +300,11 @@ func testConfig(stateDir string) Config {
 }
 
 type fakeCalendarClient struct {
-	snapshot   jmap.CalendarSnapshot
-	push       bool
-	connectErr error
-	closed     bool
+	snapshot             jmap.CalendarSnapshot
+	push                 bool
+	connectErr           error
+	closePushImmediately bool
+	closed               bool
 }
 
 func (f *fakeCalendarClient) Connect(context.Context) (bool, error) {
@@ -271,7 +318,12 @@ func (f *fakeCalendarClient) Snapshot(context.Context) (jmap.CalendarSnapshot, e
 func (f *fakeCalendarClient) SubscribeStateChanges(context.Context) (<-chan jmap.StateChange, <-chan error, func(), error) {
 	changes := make(chan jmap.StateChange)
 	errs := make(chan error)
-	return changes, errs, func() { close(changes); close(errs) }, nil
+	var once sync.Once
+	stop := func() { once.Do(func() { close(changes); close(errs) }) }
+	if f.closePushImmediately {
+		stop()
+	}
+	return changes, errs, stop, nil
 }
 
 func (f *fakeCalendarClient) Close() error {
@@ -405,6 +457,22 @@ func readJSON(t *testing.T, path string, out any) {
 	if err := json.Unmarshal(data, out); err != nil {
 		t.Fatalf("decode %s: %v", path, err)
 	}
+}
+
+func waitForStatus(t *testing.T, path string, matches func(StatusFile) bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var status StatusFile
+		data, err := os.ReadFile(path)
+		if err == nil && json.Unmarshal(data, &status) == nil && matches(status) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var status StatusFile
+	_ = json.Unmarshal(func() []byte { data, _ := os.ReadFile(path); return data }(), &status)
+	t.Fatalf("timed out waiting for status match; status=%+v", status)
 }
 
 func waitForClosed(t *testing.T, ch <-chan struct{}) {

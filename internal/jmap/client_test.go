@@ -69,6 +69,27 @@ func TestClientReturnsJMAPMethodError(t *testing.T) {
 	}
 }
 
+func TestSessionDiscoversWellKnownFromJMAPEndpointBaseURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/jmap" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"primaryAccounts":{"urn:ietf:params:jmap:calendars":"acc-cal"},"accounts":{"acc-cal":{"accountCapabilities":{"urn:ietf:params:jmap:calendars":{}}}}}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL + "/jmap", Username: "alice", Password: "secret", Timeout: time.Second})
+	info, err := client.Session(context.Background())
+	if err != nil {
+		t.Fatalf("Session() error = %v", err)
+	}
+	if info.PrimaryAccounts[CapabilityCalendars] != "acc-cal" {
+		t.Fatalf("primary accounts = %#v", info.PrimaryAccounts)
+	}
+}
+
 func contains(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

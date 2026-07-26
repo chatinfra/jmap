@@ -23,7 +23,6 @@ type options struct {
 	url       string
 	user      string
 	password  string
-	json      bool
 	timeout   time.Duration
 	trace     bool
 	stateRoot string
@@ -47,13 +46,34 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		emitError(options{}, stdout, stderr, err)
 		return err
 	}
-	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
+	if len(args) == 0 || isHelpFlag(args[0]) {
 		return printUsage(stdout)
+	}
+	if args[0] == "help" {
+		if err := printHelp(stdout, args[1:]); err != nil {
+			emitError(options{}, stdout, stderr, err)
+			return err
+		}
+		return nil
 	}
 	opts, rest, err := parseGlobal(args, os.Getenv)
 	if err != nil {
 		emitError(opts, stdout, stderr, err)
 		return err
+	}
+	if len(rest) > 0 && rest[0] == "help" {
+		if err := printHelp(stdout, rest[1:]); err != nil {
+			emitError(opts, stdout, stderr, err)
+			return err
+		}
+		return nil
+	}
+	if handled, err := printCommandHelpIfRequested(stdout, rest); handled {
+		if err != nil {
+			emitError(opts, stdout, stderr, err)
+			return err
+		}
+		return nil
 	}
 	if len(rest) == 0 {
 		err := coded("missing_command", "missing command")
@@ -86,12 +106,16 @@ func rejectJSONFlag(args []string) error {
 }
 
 func schemaDiscovery() map[string]any {
-	ids := []string{"help", "schemas", "error", "check", "raw", "calendar", "event", "availability", "principal", "participant", "addressbook", "contact", "mailbox", "message", "hours", "slot", "appointment"}
+	ids := []string{"schemas", "error", "check", "raw", "calendar", "event", "availability", "principal", "participant", "addressbook", "contact", "mailbox", "message", "hours", "slot", "appointment"}
+	return map[string]any{"tool": "jmap", "schemas": schemaEntries(ids...)}
+}
+
+func schemaEntries(ids ...string) []map[string]string {
 	schemas := make([]map[string]string, 0, len(ids))
 	for _, id := range ids {
 		schemas = append(schemas, map[string]string{"id": id, "path": "spec/outputs/" + id + ".schema.yaml"})
 	}
-	return map[string]any{"tool": "jmap", "schemas": schemas}
+	return schemas
 }
 
 func parseGlobal(args []string, getenv func(string) string) (options, []string, error) {
@@ -199,7 +223,7 @@ func run(ctx context.Context, opts options, args []string, stdout, stderr io.Wri
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, result, fmt.Sprintf("connected account=%s\n", opts.user))
+		return writeYAMLResult(stdout, result, fmt.Sprintf("connected account=%s\n", opts.user))
 	case "raw":
 		provider, err := newProvider(opts, stderr)
 		if err != nil {
@@ -327,7 +351,7 @@ func runRaw(ctx context.Context, provider jmap.Provider, opts options, args []st
 		return err
 	}
 	result := map[string]any{"method": resp.Name, "id": resp.ID, "params": json.RawMessage(resp.Params)}
-	return write(stdout, opts.json, result, fmt.Sprintf("method=%s id=%s\n", resp.Name, resp.ID))
+	return writeYAMLResult(stdout, result, fmt.Sprintf("method=%s id=%s\n", resp.Name, resp.ID))
 }
 
 func runCalendar(ctx context.Context, provider jmap.Provider, opts options, args []string, stdout io.Writer) error {
@@ -341,7 +365,7 @@ func runCalendar(ctx context.Context, provider jmap.Provider, opts options, args
 			return err
 		}
 		jmap.SortCalendars(calendars)
-		return write(stdout, opts.json, calendars, renderCalendars(calendars))
+		return writeYAMLResult(stdout, calendars, renderCalendars(calendars))
 	case "create":
 		fs := newFlagSet("jmap calendar create")
 		name := fs.String("name", "", "calendar name")
@@ -355,13 +379,13 @@ func runCalendar(ctx context.Context, provider jmap.Provider, opts options, args
 			return coded("usage", "calendar create requires --name")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "create": "calendar", "name": *name}, fmt.Sprintf("would create calendar name=%s\n", *name))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "create": "calendar", "name": *name}, fmt.Sprintf("would create calendar name=%s\n", *name))
 		}
 		calendar, err := provider.CreateCalendar(ctx, *name)
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, calendar, fmt.Sprintf("created calendar id=%s name=%s\n", calendar.ID, calendar.Name))
+		return writeYAMLResult(stdout, calendar, fmt.Sprintf("created calendar id=%s name=%s\n", calendar.ID, calendar.Name))
 	case "get":
 		fs := newFlagSet("jmap calendar get")
 		name := fs.String("name", "", "calendar name")
@@ -378,7 +402,7 @@ func runCalendar(ctx context.Context, provider jmap.Provider, opts options, args
 		}
 		for _, calendar := range calendars {
 			if (*id != "" && calendar.ID == *id) || (*name != "" && calendar.Name == *name) {
-				return write(stdout, opts.json, calendar, fmt.Sprintf("calendar id=%s name=%s\n", calendar.ID, calendar.Name))
+				return writeYAMLResult(stdout, calendar, fmt.Sprintf("calendar id=%s name=%s\n", calendar.ID, calendar.Name))
 			}
 		}
 		return coded("not_found", "calendar not found")
@@ -398,19 +422,19 @@ func runCalendar(ctx context.Context, provider jmap.Provider, opts options, args
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"calendar": calendar, "created": created}, fmt.Sprintf("calendar id=%s name=%s created=%t\n", calendar.ID, calendar.Name, created))
+		return writeYAMLResult(stdout, map[string]any{"calendar": calendar, "created": created}, fmt.Sprintf("calendar id=%s name=%s created=%t\n", calendar.ID, calendar.Name, created))
 	case "delete", "rm":
 		id := firstArg(args[1:])
 		if id == "" {
 			return coded("usage", "calendar delete requires <calendar-id>")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "delete": []string{id}}, fmt.Sprintf("would delete calendar id=%s\n", id))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "delete": []string{id}}, fmt.Sprintf("would delete calendar id=%s\n", id))
 		}
 		if err := provider.DeleteCalendar(ctx, id); err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"deleted": id}, fmt.Sprintf("deleted calendar id=%s\n", id))
+		return writeYAMLResult(stdout, map[string]any{"deleted": id}, fmt.Sprintf("deleted calendar id=%s\n", id))
 	case "delete-all", "reset":
 		if err := requireForce(opts, "calendar delete-all requires --force"); err != nil {
 			return err
@@ -424,14 +448,14 @@ func runCalendar(ctx context.Context, provider jmap.Provider, opts options, args
 			ids = append(ids, calendar.ID)
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "delete": ids}, fmt.Sprintf("would delete %d calendars\n", len(ids)))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "delete": ids}, fmt.Sprintf("would delete %d calendars\n", len(ids)))
 		}
 		for _, id := range ids {
 			if err := provider.DeleteCalendar(ctx, id); err != nil {
 				return err
 			}
 		}
-		return write(stdout, opts.json, map[string]any{"deleted": ids}, fmt.Sprintf("deleted %d calendars\n", len(ids)))
+		return writeYAMLResult(stdout, map[string]any{"deleted": ids}, fmt.Sprintf("deleted %d calendars\n", len(ids)))
 	default:
 		return coded("usage", "unknown calendar action "+args[0])
 	}
@@ -455,19 +479,19 @@ func runEvent(ctx context.Context, provider jmap.Provider, opts options, args []
 			if err != nil {
 				return err
 			}
-			return write(stdout, opts.json, list, fmt.Sprintf("events=%d\n", len(list)))
+			return writeYAMLResult(stdout, list, fmt.Sprintf("events=%d\n", len(list)))
 		}
 		events, err := provider.Events(ctx, calendarIDs)
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, events, renderEvents(events))
+		return writeYAMLResult(stdout, events, renderEvents(events))
 	case "list-json":
 		list, err := provider.EventsRaw(ctx, nil)
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, list, fmt.Sprintf("events=%d\n", len(list)))
+		return writeYAMLResult(stdout, list, fmt.Sprintf("events=%d\n", len(list)))
 	case "get", "get-json":
 		id := firstArg(args[1:])
 		if id == "" {
@@ -478,13 +502,13 @@ func runEvent(ctx context.Context, provider jmap.Provider, opts options, args []
 			if err != nil {
 				return err
 			}
-			return write(stdout, opts.json, raw, fmt.Sprintf("event id=%s\n", id))
+			return writeYAMLResult(stdout, raw, fmt.Sprintf("event id=%s\n", id))
 		}
 		event, err := provider.GetEvent(ctx, id)
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, event, renderEvent(event))
+		return writeYAMLResult(stdout, event, renderEvent(event))
 	case "create":
 		fs := newFlagSet("jmap event create")
 		title := fs.String("title", "", "event title")
@@ -513,13 +537,13 @@ func runEvent(ctx context.Context, provider jmap.Provider, opts options, args []
 			recurrence = "weekly"
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "title": *title, "start": start, "duration": duration.String(), "calendarIds": calendarIDs}, fmt.Sprintf("would create event title=%s\n", *title))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "title": *title, "start": start, "duration": duration.String(), "calendarIds": calendarIDs}, fmt.Sprintf("would create event title=%s\n", *title))
 		}
 		id, err := provider.CreateEvent(ctx, *title, start, duration, *description, calendarIDs, recurrence)
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"id": id}, fmt.Sprintf("created event id=%s\n", id))
+		return writeYAMLResult(stdout, map[string]any{"id": id}, fmt.Sprintf("created event id=%s\n", id))
 	case "create-json":
 		fs := newFlagSet("jmap event create-json")
 		body := fs.String("body", "", "event JSON object")
@@ -533,13 +557,13 @@ func runEvent(ctx context.Context, provider jmap.Provider, opts options, args []
 			return coded("usage", "event create-json requires --body JSON or positional JSON")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "event": json.RawMessage(raw)}, "would create event JSON\n")
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "event": json.RawMessage(raw)}, "would create event JSON\n")
 		}
 		id, err := provider.CreateEventRaw(ctx, json.RawMessage(raw), calendarIDs)
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"id": id}, fmt.Sprintf("created event id=%s\n", id))
+		return writeYAMLResult(stdout, map[string]any{"id": id}, fmt.Sprintf("created event id=%s\n", id))
 	case "update", "update-json":
 		fs := newFlagSet("jmap event update")
 		id := fs.String("id", "", "event id")
@@ -555,24 +579,24 @@ func runEvent(ctx context.Context, provider jmap.Provider, opts options, args []
 			return coded("usage", "event update requires --id and --body JSON")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "update": *id}, fmt.Sprintf("would update event id=%s\n", *id))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "update": *id}, fmt.Sprintf("would update event id=%s\n", *id))
 		}
 		if err := provider.UpdateEventRaw(ctx, *id, json.RawMessage(raw)); err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"updated": *id}, fmt.Sprintf("updated event id=%s\n", *id))
+		return writeYAMLResult(stdout, map[string]any{"updated": *id}, fmt.Sprintf("updated event id=%s\n", *id))
 	case "delete", "rm":
 		id := firstArg(args[1:])
 		if id == "" {
 			return coded("usage", "event delete requires <event-id>")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "delete": id}, fmt.Sprintf("would delete event id=%s\n", id))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "delete": id}, fmt.Sprintf("would delete event id=%s\n", id))
 		}
 		if err := provider.DeleteEvent(ctx, id); err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"deleted": id}, fmt.Sprintf("deleted event id=%s\n", id))
+		return writeYAMLResult(stdout, map[string]any{"deleted": id}, fmt.Sprintf("deleted event id=%s\n", id))
 	case "delete-all", "reset":
 		if err := requireForce(opts, "event delete-all requires --force"); err != nil {
 			return err
@@ -592,14 +616,14 @@ func runEvent(ctx context.Context, provider jmap.Provider, opts options, args []
 			ids = append(ids, event.ID)
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "delete": ids}, fmt.Sprintf("would delete %d events\n", len(ids)))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "delete": ids}, fmt.Sprintf("would delete %d events\n", len(ids)))
 		}
 		for _, id := range ids {
 			if err := provider.DeleteEvent(ctx, id); err != nil {
 				return err
 			}
 		}
-		return write(stdout, opts.json, map[string]any{"deleted": ids}, fmt.Sprintf("deleted %d events\n", len(ids)))
+		return writeYAMLResult(stdout, map[string]any{"deleted": ids}, fmt.Sprintf("deleted %d events\n", len(ids)))
 	case "query":
 		fs := newFlagSet("jmap event query")
 		afterValue := fs.String("after", "", "inclusive lower bound RFC3339")
@@ -628,7 +652,7 @@ func runEvent(ctx context.Context, provider jmap.Provider, opts options, args []
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, result, fmt.Sprintf("event query ids=%d total=%d\n", len(result.IDs), result.Total))
+		return writeYAMLResult(stdout, result, fmt.Sprintf("event query ids=%d total=%d\n", len(result.IDs), result.Total))
 	default:
 		return coded("usage", "unknown event action "+args[0])
 	}
@@ -664,7 +688,7 @@ func runAvailability(ctx context.Context, provider jmap.Provider, opts options, 
 	if err != nil {
 		return err
 	}
-	return write(stdout, opts.json, periods, fmt.Sprintf("busyPeriods=%d\n", len(periods)))
+	return writeYAMLResult(stdout, periods, fmt.Sprintf("busyPeriods=%d\n", len(periods)))
 }
 
 func runPrincipal(ctx context.Context, provider jmap.Provider, opts options, args []string, stdout io.Writer) error {
@@ -675,7 +699,7 @@ func runPrincipal(ctx context.Context, provider jmap.Provider, opts options, arg
 	if err != nil {
 		return err
 	}
-	return write(stdout, opts.json, result, fmt.Sprintf("principals=%d\n", len(result.IDs)))
+	return writeYAMLResult(stdout, result, fmt.Sprintf("principals=%d\n", len(result.IDs)))
 }
 
 func runParticipant(ctx context.Context, provider jmap.Provider, opts options, args []string, stdout io.Writer) error {
@@ -684,7 +708,7 @@ func runParticipant(ctx context.Context, provider jmap.Provider, opts options, a
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, participants, fmt.Sprintf("participants=%d\n", len(participants)))
+		return writeYAMLResult(stdout, participants, fmt.Sprintf("participants=%d\n", len(participants)))
 	}
 	if args[0] != "create" {
 		return coded("usage", "usage: jmap participant <list|create>")
@@ -704,13 +728,13 @@ func runParticipant(ctx context.Context, provider jmap.Provider, opts options, a
 		sendToMap["imip"] = *sendTo
 	}
 	if opts.dryRun {
-		return write(stdout, opts.json, map[string]any{"dryRun": true, "name": *name}, fmt.Sprintf("would create participant name=%s\n", *name))
+		return writeYAMLResult(stdout, map[string]any{"dryRun": true, "name": *name}, fmt.Sprintf("would create participant name=%s\n", *name))
 	}
 	id, err := provider.CreateParticipant(ctx, *name, *scheduleID, sendToMap)
 	if err != nil {
 		return err
 	}
-	return write(stdout, opts.json, map[string]any{"id": id}, fmt.Sprintf("created participant id=%s\n", id))
+	return writeYAMLResult(stdout, map[string]any{"id": id}, fmt.Sprintf("created participant id=%s\n", id))
 }
 
 func runAddressBook(ctx context.Context, provider jmap.Provider, opts options, args []string, stdout io.Writer) error {
@@ -721,7 +745,7 @@ func runAddressBook(ctx context.Context, provider jmap.Provider, opts options, a
 	if err != nil {
 		return err
 	}
-	return write(stdout, opts.json, books, fmt.Sprintf("addressBooks=%d\n", len(books)))
+	return writeYAMLResult(stdout, books, fmt.Sprintf("addressBooks=%d\n", len(books)))
 }
 
 func runContact(ctx context.Context, provider jmap.Provider, opts options, args []string, stdout io.Writer) error {
@@ -734,13 +758,13 @@ func runContact(ctx context.Context, provider jmap.Provider, opts options, args 
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, contacts, renderContacts(contacts))
+		return writeYAMLResult(stdout, contacts, renderContacts(contacts))
 	case "list-json":
 		raw, err := provider.ContactsRaw(ctx)
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, raw, fmt.Sprintf("contacts=%d\n", len(raw)))
+		return writeYAMLResult(stdout, raw, fmt.Sprintf("contacts=%d\n", len(raw)))
 	case "get", "get-json":
 		id := firstArg(args[1:])
 		if id == "" {
@@ -751,13 +775,13 @@ func runContact(ctx context.Context, provider jmap.Provider, opts options, args 
 			if err != nil {
 				return err
 			}
-			return write(stdout, opts.json, raw, fmt.Sprintf("contact id=%s\n", id))
+			return writeYAMLResult(stdout, raw, fmt.Sprintf("contact id=%s\n", id))
 		}
 		contact, err := provider.GetContact(ctx, id)
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, contact, renderContact(contact))
+		return writeYAMLResult(stdout, contact, renderContact(contact))
 	case "create":
 		contact, err := parseContactFlags("jmap contact create", args[1:])
 		if err != nil {
@@ -767,13 +791,13 @@ func runContact(ctx context.Context, provider jmap.Provider, opts options, args 
 			return coded("usage", "contact create requires a name or company")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "contact": contact}, fmt.Sprintf("would create contact name=%s\n", contact.DisplayName()))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "contact": contact}, fmt.Sprintf("would create contact name=%s\n", contact.DisplayName()))
 		}
 		id, err := provider.CreateContact(ctx, contact)
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"id": id}, fmt.Sprintf("created contact id=%s\n", id))
+		return writeYAMLResult(stdout, map[string]any{"id": id}, fmt.Sprintf("created contact id=%s\n", id))
 	case "create-json":
 		fs := newFlagSet("jmap contact create-json")
 		body := fs.String("body", "", "contact JSON object")
@@ -785,13 +809,13 @@ func runContact(ctx context.Context, provider jmap.Provider, opts options, args 
 			return coded("usage", "contact create-json requires --body JSON or positional JSON")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "contact": json.RawMessage(raw)}, "would create contact JSON\n")
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "contact": json.RawMessage(raw)}, "would create contact JSON\n")
 		}
 		id, err := provider.CreateContactRaw(ctx, json.RawMessage(raw))
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"id": id}, fmt.Sprintf("created contact id=%s\n", id))
+		return writeYAMLResult(stdout, map[string]any{"id": id}, fmt.Sprintf("created contact id=%s\n", id))
 	case "update", "update-json":
 		fs := newFlagSet("jmap contact update")
 		id := fs.String("id", "", "contact id")
@@ -807,24 +831,24 @@ func runContact(ctx context.Context, provider jmap.Provider, opts options, args 
 			return coded("usage", "contact update requires --id and --body JSON")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "update": *id}, fmt.Sprintf("would update contact id=%s\n", *id))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "update": *id}, fmt.Sprintf("would update contact id=%s\n", *id))
 		}
 		if err := provider.UpdateContactRaw(ctx, *id, json.RawMessage(raw)); err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"updated": *id}, fmt.Sprintf("updated contact id=%s\n", *id))
+		return writeYAMLResult(stdout, map[string]any{"updated": *id}, fmt.Sprintf("updated contact id=%s\n", *id))
 	case "delete", "rm":
 		id := firstArg(args[1:])
 		if id == "" {
 			return coded("usage", "contact delete requires <contact-id>")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "delete": id}, fmt.Sprintf("would delete contact id=%s\n", id))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "delete": id}, fmt.Sprintf("would delete contact id=%s\n", id))
 		}
 		if err := provider.DeleteContact(ctx, id); err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"deleted": id}, fmt.Sprintf("deleted contact id=%s\n", id))
+		return writeYAMLResult(stdout, map[string]any{"deleted": id}, fmt.Sprintf("deleted contact id=%s\n", id))
 	case "delete-all", "reset":
 		if err := requireForce(opts, "contact delete-all requires --force"); err != nil {
 			return err
@@ -838,14 +862,14 @@ func runContact(ctx context.Context, provider jmap.Provider, opts options, args 
 			ids = append(ids, contact.ID)
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "delete": ids}, fmt.Sprintf("would delete %d contacts\n", len(ids)))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "delete": ids}, fmt.Sprintf("would delete %d contacts\n", len(ids)))
 		}
 		for _, id := range ids {
 			if err := provider.DeleteContact(ctx, id); err != nil {
 				return err
 			}
 		}
-		return write(stdout, opts.json, map[string]any{"deleted": ids}, fmt.Sprintf("deleted %d contacts\n", len(ids)))
+		return writeYAMLResult(stdout, map[string]any{"deleted": ids}, fmt.Sprintf("deleted %d contacts\n", len(ids)))
 	case "search":
 		query := strings.Join(args[1:], " ")
 		if query == "" {
@@ -855,7 +879,7 @@ func runContact(ctx context.Context, provider jmap.Provider, opts options, args 
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, result, renderContactSearch(result))
+		return writeYAMLResult(stdout, result, renderContactSearch(result))
 	case "get-or-create-phone", "get-or-create-email", "get-or-create-name":
 		contact, key, err := parseContactGetOrCreate(args[0], args[1:])
 		if err != nil {
@@ -874,7 +898,7 @@ func runContact(ctx context.Context, provider jmap.Provider, opts options, args 
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"contact": result, "created": created}, fmt.Sprintf("contact id=%s created=%t\n", result.ID, created))
+		return writeYAMLResult(stdout, map[string]any{"contact": result, "created": created}, fmt.Sprintf("contact id=%s created=%t\n", result.ID, created))
 	default:
 		return coded("usage", "unknown contact action "+args[0])
 	}
@@ -888,7 +912,7 @@ func runMailbox(ctx context.Context, provider jmap.Provider, opts options, args 
 	if err != nil {
 		return err
 	}
-	return write(stdout, opts.json, mailboxes, renderMailboxes(mailboxes))
+	return writeYAMLResult(stdout, mailboxes, renderMailboxes(mailboxes))
 }
 
 func runMessage(ctx context.Context, provider jmap.Provider, opts options, args []string, stdout io.Writer) error {
@@ -906,7 +930,7 @@ func runMessage(ctx context.Context, provider jmap.Provider, opts options, args 
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"ids": ids}, fmt.Sprintf("messageIds=%d\n", len(ids)))
+		return writeYAMLResult(stdout, map[string]any{"ids": ids}, fmt.Sprintf("messageIds=%d\n", len(ids)))
 	case "query-by-mailbox":
 		mailboxID := firstArg(args[1:])
 		if mailboxID == "" {
@@ -916,7 +940,7 @@ func runMessage(ctx context.Context, provider jmap.Provider, opts options, args 
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"ids": ids, "mailboxId": mailboxID}, fmt.Sprintf("messageIds=%d mailbox=%s\n", len(ids), mailboxID))
+		return writeYAMLResult(stdout, map[string]any{"ids": ids, "mailboxId": mailboxID}, fmt.Sprintf("messageIds=%d mailbox=%s\n", len(ids), mailboxID))
 	case "get":
 		id := firstArg(args[1:])
 		if id == "" {
@@ -926,7 +950,7 @@ func runMessage(ctx context.Context, provider jmap.Provider, opts options, args 
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, message, fmt.Sprintf("message id=%s subject=%s\n", message.ID, message.Subject))
+		return writeYAMLResult(stdout, message, fmt.Sprintf("message id=%s subject=%s\n", message.ID, message.Subject))
 	case "create":
 		fs := newFlagSet("jmap message create")
 		mailboxID := fs.String("mailbox-id", "", "mailbox id")
@@ -941,25 +965,25 @@ func runMessage(ctx context.Context, provider jmap.Provider, opts options, args 
 			return coded("usage", "message create requires --mailbox-id, --from, and --subject")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "mailboxId": *mailboxID, "subject": *subject}, fmt.Sprintf("would create message subject=%s\n", *subject))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "mailboxId": *mailboxID, "subject": *subject}, fmt.Sprintf("would create message subject=%s\n", *subject))
 		}
 		id, err := provider.CreateMessage(ctx, *mailboxID, *from, *subject, *messageID, *body)
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"id": id}, fmt.Sprintf("created message id=%s\n", id))
+		return writeYAMLResult(stdout, map[string]any{"id": id}, fmt.Sprintf("created message id=%s\n", id))
 	case "delete", "rm":
 		id := firstArg(args[1:])
 		if id == "" {
 			return coded("usage", "message delete requires <message-id>")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "delete": id}, fmt.Sprintf("would delete message id=%s\n", id))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "delete": id}, fmt.Sprintf("would delete message id=%s\n", id))
 		}
 		if err := provider.DeleteMessage(ctx, id); err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"deleted": id}, fmt.Sprintf("deleted message id=%s\n", id))
+		return writeYAMLResult(stdout, map[string]any{"deleted": id}, fmt.Sprintf("deleted message id=%s\n", id))
 	default:
 		return coded("usage", "unknown message action "+args[0])
 	}
@@ -977,7 +1001,7 @@ func runHours(ctx context.Context, provider *jmap.Provider, opts options, args [
 	_ = rest
 	switch action {
 	case "json", "list", "show":
-		return write(stdout, opts.json, config, renderHours(config))
+		return writeYAMLResult(stdout, config, renderHours(config))
 	case "ensure":
 		if provider == nil {
 			return coded("missing_config", "hours ensure requires JMAP connection configuration")
@@ -986,7 +1010,7 @@ func runHours(ctx context.Context, provider *jmap.Provider, opts options, args [
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, result, fmt.Sprintf("ensured calendars=%d hoursCreated=%d\n", len(result.Calendars), len(result.CreatedEventIDs)))
+		return writeYAMLResult(stdout, result, fmt.Sprintf("ensured calendars=%d hoursCreated=%d\n", len(result.Calendars), len(result.CreatedEventIDs)))
 	default:
 		return coded("usage", "unknown hours action "+action)
 	}
@@ -1080,7 +1104,7 @@ func runSlot(ctx context.Context, provider jmap.Provider, opts options, args []s
 			return err
 		}
 		slots := schedule.AvailableSlotsRange(from, to, duration, periods, hoursKeys, apptKeys)
-		return write(stdout, opts.json, slots, renderSlots(slots))
+		return writeYAMLResult(stdout, slots, renderSlots(slots))
 	case "date", "for-date":
 		fs := newFlagSet("jmap slot date")
 		date := fs.String("date", "", "local date YYYY-MM-DD")
@@ -1105,7 +1129,7 @@ func runSlot(ctx context.Context, provider jmap.Provider, opts options, args []s
 			return err
 		}
 		slots := schedule.AvailableSlotsRange(day, day.AddDate(0, 0, 1), duration, periods, hoursKeys, apptKeys)
-		return write(stdout, opts.json, slots, renderSlots(slots))
+		return writeYAMLResult(stdout, slots, renderSlots(slots))
 	case "busy", "is-busy", "within-hours", "conflicts":
 		fs := newFlagSet("jmap slot " + action)
 		startValue := fs.String("start", "", "start RFC3339")
@@ -1128,14 +1152,14 @@ func runSlot(ctx context.Context, provider jmap.Provider, opts options, args []s
 		}
 		if action == "conflicts" {
 			conflicts := schedule.ConflictingAppointments(periods, apptKeys, start, end)
-			return write(stdout, opts.json, conflicts, fmt.Sprintf("conflicts=%d\n", len(conflicts)))
+			return writeYAMLResult(stdout, conflicts, fmt.Sprintf("conflicts=%d\n", len(conflicts)))
 		}
 		if action == "within-hours" {
 			ok := schedule.IsWithinBusinessHours(periods, hoursKeys, start, end)
-			return write(stdout, opts.json, map[string]any{"withinHours": ok}, fmt.Sprintf("withinHours=%t\n", ok))
+			return writeYAMLResult(stdout, map[string]any{"withinHours": ok}, fmt.Sprintf("withinHours=%t\n", ok))
 		}
 		busy := schedule.IsBusy(periods, apptKeys, start, end)
-		return write(stdout, opts.json, map[string]any{"busy": busy}, fmt.Sprintf("busy=%t\n", busy))
+		return writeYAMLResult(stdout, map[string]any{"busy": busy}, fmt.Sprintf("busy=%t\n", busy))
 	default:
 		return coded("usage", "unknown slot action "+action)
 	}
@@ -1229,7 +1253,7 @@ func runAppointment(ctx context.Context, opts options, args []string, stdout, st
 	switch args[0] {
 	case "services":
 		services := appointment.DefaultServices()
-		return write(stdout, opts.json, services, renderServices(services))
+		return writeYAMLResult(stdout, services, renderServices(services))
 	case "default-services":
 		fs := newFlagSet("jmap appointment default-services")
 		contactID := fs.String("contact-id", "", "contact id")
@@ -1240,7 +1264,7 @@ func runAppointment(ctx context.Context, opts options, args []string, stdout, st
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, services, renderServices(services))
+		return writeYAMLResult(stdout, services, renderServices(services))
 	case "create":
 		return runAppointmentCreate(ctx, opts, store, args[1:], stdout, stderr)
 	case "list", "ls":
@@ -1262,7 +1286,7 @@ func runAppointment(ctx context.Context, opts options, args []string, stdout, st
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, entries, renderAppointments(entries))
+		return writeYAMLResult(stdout, entries, renderAppointments(entries))
 	case "get":
 		eventID := firstArg(args[1:])
 		if eventID == "" {
@@ -1275,7 +1299,7 @@ func runAppointment(ctx context.Context, opts options, args []string, stdout, st
 		if !ok {
 			return coded("not_found", "appointment not found: "+eventID)
 		}
-		return write(stdout, opts.json, entry, renderAppointments([]appointment.Entry{entry}))
+		return writeYAMLResult(stdout, entry, renderAppointments([]appointment.Entry{entry}))
 	case "cancel":
 		provider, err := newProvider(opts, stderr)
 		if err != nil {
@@ -1286,12 +1310,12 @@ func runAppointment(ctx context.Context, opts options, args []string, stdout, st
 			return coded("usage", "appointment cancel requires <event-id>")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "cancel": eventID}, fmt.Sprintf("would cancel appointment event=%s\n", eventID))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "cancel": eventID}, fmt.Sprintf("would cancel appointment event=%s\n", eventID))
 		}
 		if err := provider.DeleteEvent(ctx, eventID); err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"cancelled": []string{eventID}}, fmt.Sprintf("cancelled appointment event=%s\n", eventID))
+		return writeYAMLResult(stdout, map[string]any{"cancelled": []string{eventID}}, fmt.Sprintf("cancelled appointment event=%s\n", eventID))
 	case "cancel-multiple", "cancel-many":
 		provider, err := newProvider(opts, stderr)
 		if err != nil {
@@ -1302,14 +1326,14 @@ func runAppointment(ctx context.Context, opts options, args []string, stdout, st
 			return coded("usage", "appointment cancel-multiple requires event ids")
 		}
 		if opts.dryRun {
-			return write(stdout, opts.json, map[string]any{"dryRun": true, "cancel": ids}, fmt.Sprintf("would cancel %d appointments\n", len(ids)))
+			return writeYAMLResult(stdout, map[string]any{"dryRun": true, "cancel": ids}, fmt.Sprintf("would cancel %d appointments\n", len(ids)))
 		}
 		for _, id := range ids {
 			if err := provider.DeleteEvent(ctx, id); err != nil {
 				return err
 			}
 		}
-		return write(stdout, opts.json, map[string]any{"cancelled": ids}, fmt.Sprintf("cancelled %d appointments\n", len(ids)))
+		return writeYAMLResult(stdout, map[string]any{"cancelled": ids}, fmt.Sprintf("cancelled %d appointments\n", len(ids)))
 	case "update-contact-name":
 		fs := newFlagSet("jmap appointment update-contact-name")
 		contactID := fs.String("contact-id", "", "contact id")
@@ -1324,7 +1348,7 @@ func runAppointment(ctx context.Context, opts options, args []string, stdout, st
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, updated, fmt.Sprintf("updated appointments=%d\n", len(updated)))
+		return writeYAMLResult(stdout, updated, fmt.Sprintf("updated appointments=%d\n", len(updated)))
 	case "dates", "available-dates", "times", "available-times", "times-for-date", "next", "next-available", "query-exact":
 		return runAppointmentAvailability(opts, args, stdout)
 	case "waiting-list":
@@ -1344,7 +1368,7 @@ func runAppointment(ctx context.Context, opts options, args []string, stdout, st
 		if err := store.AddWaitingList(req); err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"persisted": true, "request": req}, "waiting-list request persisted\n")
+		return writeYAMLResult(stdout, map[string]any{"persisted": true, "request": req}, "waiting-list request persisted\n")
 	case "notification":
 		return runAppointmentNotification(store, opts, args[1:], stdout)
 	default:
@@ -1406,7 +1430,7 @@ func runAppointmentCreate(ctx context.Context, opts options, store *appointment.
 		}
 	}
 	if opts.dryRun {
-		return write(stdout, opts.json, map[string]any{"dryRun": true, "title": *title, "contactId": *contactID, "start": start, "duration": duration.String(), "services": services}, fmt.Sprintf("would book appointment contact=%s start=%s\n", *contactID, start.Format(time.RFC3339)))
+		return writeYAMLResult(stdout, map[string]any{"dryRun": true, "title": *title, "contactId": *contactID, "start": start, "duration": duration.String(), "services": services}, fmt.Sprintf("would book appointment contact=%s start=%s\n", *contactID, start.Format(time.RFC3339)))
 	}
 	provider, err := newProvider(opts, stderr)
 	if err != nil {
@@ -1438,7 +1462,7 @@ func runAppointmentCreate(ctx context.Context, opts options, store *appointment.
 	if err := store.PutEntry(entry); err != nil {
 		return err
 	}
-	return write(stdout, opts.json, map[string]any{"status": "booked", "appointment": entry}, fmt.Sprintf("booked appointment event=%s\n", eventID))
+	return writeYAMLResult(stdout, map[string]any{"status": "booked", "appointment": entry}, fmt.Sprintf("booked appointment event=%s\n", eventID))
 }
 
 func runAppointmentAvailability(opts options, args []string, stdout io.Writer) error {
@@ -1467,7 +1491,7 @@ func runAppointmentAvailability(opts options, args []string, stdout io.Writer) e
 	switch action {
 	case "dates", "available-dates":
 		result := schedule.AvailableDates(config, now, duration, nil)
-		return write(stdout, opts.json, result, fmt.Sprintf("availableDates=%d\n", len(result)))
+		return writeYAMLResult(stdout, result, fmt.Sprintf("availableDates=%d\n", len(result)))
 	case "times", "available-times":
 		from, err := parseTime(*fromValue)
 		if err != nil {
@@ -1478,7 +1502,7 @@ func runAppointmentAvailability(opts options, args []string, stdout io.Writer) e
 			return err
 		}
 		slots := schedule.AvailableSlots(config, from, to, duration, nil)
-		return write(stdout, opts.json, slots, renderSlots(slots))
+		return writeYAMLResult(stdout, slots, renderSlots(slots))
 	case "times-for-date":
 		if *date == "" {
 			return coded("usage", "times-for-date requires --date")
@@ -1487,16 +1511,16 @@ func runAppointmentAvailability(opts options, args []string, stdout io.Writer) e
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, slots, renderSlots(slots))
+		return writeYAMLResult(stdout, slots, renderSlots(slots))
 	case "next", "next-available":
 		slots := schedule.NextAvailable(config, now.Add(20*time.Minute), duration, nil, *limit)
-		return write(stdout, opts.json, slots, renderSlots(slots))
+		return writeYAMLResult(stdout, slots, renderSlots(slots))
 	case "query-exact":
 		if len(dates) == 0 && *date != "" {
 			dates = append(dates, *date)
 		}
 		result := exactAvailability(config, dates, times, duration, *limit)
-		return write(stdout, opts.json, result, fmt.Sprintf("available=%d alternates=%d\n", len(result["available"].([]schedule.Slot)), len(result["alternates"].([]schedule.Slot))))
+		return writeYAMLResult(stdout, result, fmt.Sprintf("available=%d alternates=%d\n", len(result["available"].([]schedule.Slot)), len(result["alternates"].([]schedule.Slot))))
 	default:
 		return coded("usage", "unknown appointment availability action "+action)
 	}
@@ -1541,7 +1565,7 @@ func runAppointmentNotification(store *appointment.Store, opts options, args []s
 		if err := store.MarkNotificationSent(eventID, time.Now().UTC()); err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"eventId": eventID, "marked": "sent"}, fmt.Sprintf("marked sent event=%s\n", eventID))
+		return writeYAMLResult(stdout, map[string]any{"eventId": eventID, "marked": "sent"}, fmt.Sprintf("marked sent event=%s\n", eventID))
 	case "mark-failed":
 		fs := newFlagSet("jmap appointment notification mark-failed")
 		eventID := fs.String("event-id", "", "event id")
@@ -1558,7 +1582,7 @@ func runAppointmentNotification(store *appointment.Store, opts options, args []s
 		if err := store.MarkNotificationFailed(*eventID, *message, time.Now().UTC()); err != nil {
 			return err
 		}
-		return write(stdout, opts.json, map[string]any{"eventId": *eventID, "marked": "failed"}, fmt.Sprintf("marked failed event=%s\n", *eventID))
+		return writeYAMLResult(stdout, map[string]any{"eventId": *eventID, "marked": "failed"}, fmt.Sprintf("marked failed event=%s\n", *eventID))
 	case "notify-due":
 		fs := newFlagSet("jmap appointment notification notify-due")
 		withinValue := fs.String("within", "24h", "duration window")
@@ -1573,13 +1597,13 @@ func runAppointmentNotification(store *appointment.Store, opts options, args []s
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, due, fmt.Sprintf("notifyDue=%d\n", len(due)))
+		return writeYAMLResult(stdout, due, fmt.Sprintf("notifyDue=%d\n", len(due)))
 	case "list":
 		notifications, err := store.Notifications()
 		if err != nil {
 			return err
 		}
-		return write(stdout, opts.json, notifications, fmt.Sprintf("notifications=%d\n", len(notifications)))
+		return writeYAMLResult(stdout, notifications, fmt.Sprintf("notifications=%d\n", len(notifications)))
 	default:
 		return coded("usage", "unknown notification action "+args[0])
 	}
@@ -1746,7 +1770,7 @@ func newFlagSet(name string) *flag.FlagSet {
 	return fs
 }
 
-func write(out io.Writer, asJSON bool, value any, human string) error {
+func writeYAMLResult(out io.Writer, value any, _ string) error {
 	return writeYAML(out, value)
 }
 
@@ -1951,34 +1975,549 @@ func min(a, b int) int {
 	return b
 }
 
+type helpItem struct {
+	Name    string
+	Summary string
+}
+
+type helpTopic struct {
+	Summary  string
+	Usage    []string
+	Commands []helpItem
+	Flags    []helpItem
+	Output   []string
+	Examples []string
+	SeeAlso  []string
+}
+
+func isHelpFlag(arg string) bool { return arg == "--help" || arg == "-h" }
+
 func printUsage(out io.Writer) error {
-	return writeYAML(out, map[string]any{
-		"tool":    "jmap",
-		"summary": "Pure Go JMAP/Cyrus CLI for calendars, contacts, mail, scheduling, and appointments",
-		"usage":   "jmap [global flags] <command> [command args]",
-		"flags": []map[string]string{
-			{"name": "--url URL", "summary": "JMAP base URL; default JMAP_URL"},
-			{"name": "--user USER", "summary": "JMAP account/username; default JMAP_USER"},
-			{"name": "--password PASS", "summary": "JMAP password; default JMAP_PASSWORD"},
-			{"name": "--timeout D", "summary": "request timeout"},
-			{"name": "--trace", "summary": "write redacted HTTP traces to stderr"},
-			{"name": "--state-root DIR", "summary": "local appointment state root"},
-			{"name": "--dry-run", "summary": "preview mutating commands where possible"},
-			{"name": "--force", "summary": "confirm destructive bulk commands"},
+	return renderHelpTopic(out, rootHelpTopic())
+}
+
+func printHelp(out io.Writer, rawTopic []string) error {
+	topicPath := filterHelpTopicArgs(rawTopic)
+	if len(topicPath) == 0 {
+		return printUsage(out)
+	}
+	topics := helpTopics()
+	key := normalizeHelpTopic(topicPath)
+	topic, ok := topics[key]
+	if !ok {
+		return coded("unknown_help_topic", fmt.Sprintf("unknown help topic %q; run \"jmap help\" for available commands", strings.Join(topicPath, " ")))
+	}
+	return renderHelpTopic(out, topic)
+}
+
+func printCommandHelpIfRequested(out io.Writer, args []string) (bool, error) {
+	topicPath, ok := commandHelpTopicPath(args)
+	if !ok {
+		return false, nil
+	}
+	return true, printHelp(out, topicPath)
+}
+
+func filterHelpTopicArgs(args []string) []string {
+	path := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == "--" || isHelpFlag(arg) {
+			break
+		}
+		if strings.HasPrefix(arg, "-") {
+			break
+		}
+		path = append(path, arg)
+	}
+	return path
+}
+
+func commandHelpTopicPath(args []string) ([]string, bool) {
+	helpIndex := -1
+	for i, arg := range args {
+		if isHelpFlag(arg) {
+			helpIndex = i
+			break
+		}
+	}
+	if helpIndex < 0 {
+		return nil, false
+	}
+	return filterHelpTopicArgs(args[:helpIndex]), true
+}
+
+func normalizeHelpTopic(path []string) string {
+	normalized := make([]string, 0, len(path))
+	for _, item := range path {
+		item = strings.ToLower(strings.TrimSpace(item))
+		if item == "" {
+			continue
+		}
+		normalized = append(normalized, helpAlias(item))
+	}
+	return strings.Join(normalized, " ")
+}
+
+func helpAlias(token string) string {
+	switch token {
+	case "schema":
+		return "schemas"
+	case "calendars":
+		return "calendar"
+	case "events":
+		return "event"
+	case "principals":
+		return "principal"
+	case "participants":
+		return "participant"
+	case "addressbooks", "address-books":
+		return "addressbook"
+	case "contacts":
+		return "contact"
+	case "mailboxes":
+		return "mailbox"
+	case "messages":
+		return "message"
+	case "slots":
+		return "slot"
+	case "appointments":
+		return "appointment"
+	case "ls":
+		return "list"
+	case "rm":
+		return "delete"
+	case "ensure":
+		return "get-or-create"
+	case "reset":
+		return "delete-all"
+	case "ids", "query-ids":
+		return "query"
+	case "for-date":
+		return "date"
+	case "available-dates":
+		return "dates"
+	case "available-times":
+		return "times"
+	case "next-available":
+		return "next"
+	default:
+		return token
+	}
+}
+
+func renderHelpTopic(out io.Writer, topic helpTopic) error {
+	var b strings.Builder
+	b.WriteString(topic.Summary)
+	b.WriteString("\n")
+	writeHelpSection(&b, "USAGE", topic.Usage)
+	writeHelpItemsSection(&b, "COMMANDS", topic.Commands)
+	writeHelpItemsSection(&b, "FLAGS", topic.Flags)
+	writeHelpSection(&b, "OUTPUT", topic.Output)
+	writeHelpSection(&b, "EXAMPLES", topic.Examples)
+	writeHelpSection(&b, "SEE ALSO", topic.SeeAlso)
+	_, err := io.WriteString(out, b.String())
+	return err
+}
+
+func writeHelpSection(b *strings.Builder, heading string, lines []string) {
+	if len(lines) == 0 {
+		return
+	}
+	b.WriteString("\n")
+	b.WriteString(heading)
+	b.WriteString("\n")
+	for _, line := range lines {
+		fmt.Fprintf(b, "  %s\n", line)
+	}
+}
+
+func writeHelpItemsSection(b *strings.Builder, heading string, items []helpItem) {
+	if len(items) == 0 {
+		return
+	}
+	b.WriteString("\n")
+	b.WriteString(heading)
+	b.WriteString("\n")
+	for _, item := range items {
+		fmt.Fprintf(b, "  %-28s %s\n", item.Name, item.Summary)
+	}
+}
+
+func rootHelpTopic() helpTopic {
+	return helpTopic{
+		Summary: "jmap - Pure Go JMAP/Cyrus CLI for calendars, contacts, mail, scheduling, and appointments",
+		Usage: []string{
+			"jmap [global flags] <command> [command args]",
+			"jmap help <command> [subcommand]",
+			"jmap <command> [subcommand] --help",
 		},
-		"commands": []map[string]string{
-			{"name": "check", "summary": "verify JMAP connection", "schema": "check"},
-			{"name": "raw", "summary": "send a raw JMAP method call; --params remains JSON input", "schema": "raw"},
-			{"name": "calendar", "summary": "calendar commands", "schema": "calendar"},
-			{"name": "event", "summary": "event commands", "schema": "event"},
-			{"name": "contact", "summary": "contact commands", "schema": "contact"},
-			{"name": "mailbox", "summary": "mailbox commands", "schema": "mailbox"},
-			{"name": "message", "summary": "message commands", "schema": "message"},
-			{"name": "hours", "summary": "business-hours helpers", "schema": "hours"},
-			{"name": "slot", "summary": "availability slot helpers", "schema": "slot"},
-			{"name": "appointment", "summary": "appointment workflow helpers", "schema": "appointment"},
-			{"name": "schemas", "summary": "list output schemas", "schema": "schemas"},
+		Commands: []helpItem{
+			{"check", "verify JMAP connection and credentials"},
+			{"raw", "send raw JMAP method calls"},
+			{"calendar", "list, create, find, and delete calendars"},
+			{"event", "list, query, create, update, and delete calendar events"},
+			{"availability", "check busy periods for a time range"},
+			{"principal", "list JMAP principals"},
+			{"participant", "list or create calendar participants"},
+			{"addressbook", "list contact address books"},
+			{"contact", "list, search, create, update, and delete contacts"},
+			{"mailbox", "list mailboxes"},
+			{"message", "query, read, create, and delete email messages"},
+			{"hours", "show or ensure business-hours configuration"},
+			{"slot", "find availability slots and appointment conflicts"},
+			{"appointment", "manage appointment state and booking helpers"},
+			{"schemas", "list structured output schema IDs and paths"},
 		},
-		"schemas": []string{"help", "schemas", "error", "check", "raw", "calendar", "event", "contact", "mailbox", "message", "hours", "slot", "appointment"},
+		Flags: globalHelpFlags(),
+		Output: []string{
+			"stdout: successful command results use documented YAML shapes; help uses this terminal text.",
+			"stderr: failures use coded YAML error envelopes; traces redact passwords and Authorization headers.",
+			"structured discovery: run \"jmap schemas\" for machine-readable output schema IDs and paths.",
+		},
+		Examples: []string{
+			"jmap --url https://mail.example/jmap --user alice --password '<password>' check",
+			"jmap calendar list",
+			"jmap event query --after 2026-01-01T00:00:00Z --before 2026-01-02T00:00:00Z",
+			"jmap help appointment create",
+		},
+		SeeAlso: []string{
+			"jmap schemas",
+			"go/CLI_SPEC.md",
+		},
+	}
+}
+
+func globalHelpFlags() []helpItem {
+	return []helpItem{
+		{"--url URL", "JMAP base URL (default: JMAP_URL)"},
+		{"--user USER", "JMAP account username (default: JMAP_USER)"},
+		{"--password PASS", "JMAP password (default: JMAP_PASSWORD)"},
+		{"--timeout DURATION", "request timeout; 0 disables client timeout (default: JMAP_TIMEOUT or 30s)"},
+		{"--trace", "write redacted HTTP traces to stderr (default: JMAP_TRACE=false)"},
+		{"--state-root DIR", "appointment state root (default: JMAP_STATE_ROOT or user config)"},
+		{"--dry-run", "preview mutating commands where supported (default: JMAP_DRY_RUN=false)"},
+		{"--force", "confirm destructive bulk commands (default: JMAP_FORCE=false)"},
+	}
+}
+
+func scheduleHelpFlags() []helpItem {
+	return []helpItem{
+		{"--appt-calendar NAME", "appointment calendar name (default: appts)"},
+		{"--hours-calendar NAME", "business-hours calendar name (default: hours)"},
+		{"--slot-days N", "days to search for generated slots (default: 30)"},
+		{"--timezone TZ", "IANA timezone for local schedule calculations (default: America/New_York)"},
+		{"--hours SPEC", "weekly hours override such as mon-fri=09:00-17:00"},
+	}
+}
+
+func helpTopics() map[string]helpTopic {
+	topics := map[string]helpTopic{}
+	add := func(key string, topic helpTopic) {
+		topics[key] = topic
+	}
+
+	add("check", helpTopic{
+		Summary: "jmap check - verify JMAP connection and credentials",
+		Usage:   []string{"jmap [global flags] check"},
+		Flags:   []helpItem{{"global flags", "provide --url, --user, --password, and optional --timeout before the command"}},
+		Output: []string{
+			"stdout: YAML check result with connection status.",
+			"stderr: coded YAML error envelope when configuration or the JMAP request fails.",
+		},
+		Examples: []string{"jmap --url https://mail.example/jmap --user alice --password '<password>' check"},
+		SeeAlso:  []string{"jmap schemas"},
 	})
+
+	add("raw", helpTopic{
+		Summary: "jmap raw - send raw JMAP method calls",
+		Usage:   []string{"jmap [global flags] raw call <method> --params JSON [--capability URN]"},
+		Commands: []helpItem{
+			{"call", "send one JMAP method call with JSON params"},
+		},
+		Output: []string{
+			"stdout: YAML raw method response with method name, id, and params.",
+			"stderr: coded YAML error envelope on parse, configuration, or JMAP request failures.",
+		},
+		Examples: []string{"jmap raw call Calendar/get --params '{\"ids\":null}' --capability urn:ietf:params:jmap:calendars"},
+		SeeAlso:  []string{"jmap help raw call", "jmap schemas"},
+	})
+	add("raw call", helpTopic{
+		Summary: "jmap raw call - send one arbitrary JMAP method call",
+		Usage:   []string{"jmap [global flags] raw call <method> --params JSON [--capability URN]"},
+		Flags: []helpItem{
+			{"--params JSON", "JMAP method params object (default: {})"},
+			{"--capability URN", "JMAP capability URI; repeat for multiple capabilities"},
+		},
+		Output: []string{
+			"stdout: YAML raw response containing method, id, and params.",
+			"stderr: coded YAML error envelope; JSON params remain input JSON and are not a CLI output mode.",
+		},
+		Examples: []string{"jmap raw call Mailbox/get --params '{\"ids\":null}' --capability urn:ietf:params:jmap:mail"},
+		SeeAlso:  []string{"jmap schemas"},
+	})
+
+	add("calendar", helpTopic{
+		Summary: "jmap calendar - list, create, find, and delete calendars",
+		Usage:   []string{"jmap [global flags] calendar <list|create|get|get-or-create|delete|delete-all> [args]"},
+		Commands: []helpItem{
+			{"list", "list calendars (alias: ls)"},
+			{"create", "create a calendar by --name or positional name"},
+			{"get", "find one calendar by --name, --id, or positional name"},
+			{"get-or-create", "return an existing calendar or create it (alias: ensure)"},
+			{"delete", "delete one calendar by id (alias: rm)"},
+			{"delete-all", "delete all calendars; requires --force (alias: reset)"},
+		},
+		Output:   []string{"stdout: YAML calendar result or list according to the selected action.", "stderr: coded YAML error envelope on usage, configuration, or JMAP failures."},
+		Examples: []string{"jmap calendar list", "jmap calendar create --name appts", "jmap --force calendar delete-all"},
+		SeeAlso:  []string{"jmap help calendar create", "jmap schemas"},
+	})
+	add("calendar create", helpTopic{
+		Summary:  "jmap calendar create - create one calendar",
+		Usage:    []string{"jmap [global flags] calendar create --name NAME", "jmap [global flags] calendar create NAME"},
+		Flags:    []helpItem{{"--name NAME", "calendar display name (default: first positional argument)"}, {"--dry-run", "preview creation when supplied as a global flag before the command"}},
+		Output:   []string{"stdout: YAML created calendar result, or dry-run preview when --dry-run is set.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap calendar create --name appts", "jmap --dry-run calendar create demo"},
+		SeeAlso:  []string{"jmap help calendar", "jmap schemas"},
+	})
+
+	add("event", helpTopic{
+		Summary: "jmap event - list, query, create, update, and delete calendar events",
+		Usage:   []string{"jmap [global flags] event <list|get|create|query|update|delete|delete-all> [args]"},
+		Commands: []helpItem{
+			{"list", "list events; accepts repeated --calendar-id"},
+			{"get", "read one event by id"},
+			{"create", "create an event with title, start, duration, and optional calendar ids"},
+			{"query", "query event ids in a time range"},
+			{"update", "patch an event from a JSON body"},
+			{"delete", "delete one event by id"},
+			{"delete-all", "delete events; requires --force"},
+		},
+		Output:   []string{"stdout: YAML event result, list, query response, or mutation confirmation.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap event list --calendar-id cal-1", "jmap event query --after 2026-01-01T00:00:00Z --before 2026-01-02T00:00:00Z"},
+		SeeAlso:  []string{"jmap help event query", "jmap schemas"},
+	})
+	add("event query", helpTopic{
+		Summary: "jmap event query - query event ids by time range and calendar",
+		Usage:   []string{"jmap [global flags] event query [--after RFC3339] [--before RFC3339] [--calendar-id ID]"},
+		Flags: []helpItem{
+			{"--after RFC3339", "inclusive lower time bound"},
+			{"--before RFC3339", "exclusive upper time bound"},
+			{"--calendar-id ID", "calendar id filter; repeatable"},
+		},
+		Output:   []string{"stdout: YAML query response with returned ids and total count.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap event query --after 2026-01-01T00:00:00Z --before 2026-01-02T00:00:00Z --calendar-id cal-1"},
+		SeeAlso:  []string{"jmap help event", "jmap schemas"},
+	})
+
+	add("availability", helpTopic{
+		Summary:  "jmap availability - check busy periods for a time range",
+		Usage:    []string{"jmap [global flags] availability [check|list] --start RFC3339 (--end RFC3339 | --duration DURATION)"},
+		Flags:    []helpItem{{"--start RFC3339", "range start"}, {"--end RFC3339", "range end"}, {"--duration DURATION", "duration used when --end is omitted"}},
+		Output:   []string{"stdout: YAML busy-period list.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap availability --start 2026-01-05T14:00:00Z --duration 30m"},
+		SeeAlso:  []string{"jmap schemas"},
+	})
+
+	add("principal", helpTopic{
+		Summary:  "jmap principal - list JMAP principals",
+		Usage:    []string{"jmap [global flags] principal list"},
+		Output:   []string{"stdout: YAML principal query result.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap principal list"},
+		SeeAlso:  []string{"jmap schemas"},
+	})
+
+	add("participant", helpTopic{
+		Summary: "jmap participant - list or create calendar participants",
+		Usage:   []string{"jmap [global flags] participant <list|create> [args]"},
+		Commands: []helpItem{
+			{"list", "list participants"},
+			{"create", "create a participant with --name and optional scheduling fields"},
+		},
+		Flags:    []helpItem{{"--name NAME", "participant name for create"}, {"--schedule-id ID", "schedule id for create"}, {"--send-to URI", "sendTo mailto URI for create"}},
+		Output:   []string{"stdout: YAML participant list or creation result.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap participant list", "jmap participant create --name Ada --send-to mailto:ada@example.test"},
+		SeeAlso:  []string{"jmap schemas"},
+	})
+
+	add("addressbook", helpTopic{
+		Summary:  "jmap addressbook - list contact address books",
+		Usage:    []string{"jmap [global flags] addressbook list"},
+		Output:   []string{"stdout: YAML address book list.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap addressbook list"},
+		SeeAlso:  []string{"jmap schemas"},
+	})
+
+	add("contact", helpTopic{
+		Summary: "jmap contact - list, search, create, update, and delete contacts",
+		Usage:   []string{"jmap [global flags] contact <list|get|create|update|delete|delete-all|search|get-or-create-phone|get-or-create-email|get-or-create-name> [args]"},
+		Commands: []helpItem{
+			{"list", "list contacts (alias: ls)"},
+			{"get", "read one contact by id"},
+			{"create", "create a contact from name, email, phone, or company fields"},
+			{"update", "patch a contact from a JSON body"},
+			{"delete", "delete one contact by id"},
+			{"delete-all", "delete all contacts; requires --force"},
+			{"search", "search contacts by name or phone"},
+			{"get-or-create-*", "find or create contacts by phone, email, or name"},
+		},
+		Output:   []string{"stdout: YAML contact result, list, search result, or mutation confirmation.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap contact search Ada", "jmap contact create --first-name Ada --last-name Lovelace --email ada@example.test"},
+		SeeAlso:  []string{"jmap help contact create", "jmap schemas"},
+	})
+	add("contact create", helpTopic{
+		Summary: "jmap contact create - create one contact",
+		Usage:   []string{"jmap [global flags] contact create [--first-name NAME] [--last-name NAME] [--company NAME] [--email VALUE] [--phone VALUE] [--address VALUE]"},
+		Flags: []helpItem{
+			{"--first-name NAME", "first name"},
+			{"--last-name NAME", "last name"},
+			{"--company NAME", "company name"},
+			{"--email VALUE", "email value; repeatable"},
+			{"--phone VALUE", "phone value; repeatable"},
+			{"--address VALUE", "address value; repeatable"},
+		},
+		Output:   []string{"stdout: YAML created contact id, or dry-run preview when --dry-run is set.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap contact create --first-name Ada --last-name Lovelace --email ada@example.test --phone +15551234567"},
+		SeeAlso:  []string{"jmap help contact", "jmap schemas"},
+	})
+
+	add("mailbox", helpTopic{
+		Summary:  "jmap mailbox - list mailboxes",
+		Usage:    []string{"jmap [global flags] mailbox list"},
+		Output:   []string{"stdout: YAML mailbox list.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap mailbox list"},
+		SeeAlso:  []string{"jmap schemas"},
+	})
+
+	add("message", helpTopic{
+		Summary: "jmap message - query, read, create, and delete email messages",
+		Usage:   []string{"jmap [global flags] message <query|get|create|delete> [args]"},
+		Commands: []helpItem{
+			{"query", "query message ids, optionally by --mailbox-id"},
+			{"query-by-mailbox", "query message ids for a mailbox id"},
+			{"get", "read one message by id"},
+			{"create", "create a message in a mailbox"},
+			{"delete", "delete one message by id"},
+		},
+		Output:   []string{"stdout: YAML message result, ids list, or mutation confirmation.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap message query --mailbox-id mailbox-1", "jmap message get message-1"},
+		SeeAlso:  []string{"jmap help message create", "jmap schemas"},
+	})
+	add("message create", helpTopic{
+		Summary: "jmap message create - create one email message",
+		Usage:   []string{"jmap [global flags] message create --mailbox-id ID --from ADDRESS --subject TEXT [--message-id ID] [--body TEXT]"},
+		Flags: []helpItem{
+			{"--mailbox-id ID", "target mailbox id"},
+			{"--from ADDRESS", "sender address"},
+			{"--subject TEXT", "message subject"},
+			{"--message-id ID", "optional message id"},
+			{"--body TEXT", "plain text body"},
+		},
+		Output:   []string{"stdout: YAML created message id, or dry-run preview when --dry-run is set.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap message create --mailbox-id inbox --from alice@example.test --subject Hello --body 'Hi there'"},
+		SeeAlso:  []string{"jmap help message", "jmap schemas"},
+	})
+
+	add("hours", helpTopic{
+		Summary: "jmap hours - show or ensure business-hours configuration",
+		Usage:   []string{"jmap [global flags] hours <json|ensure> [schedule flags]"},
+		Commands: []helpItem{
+			{"json", "print normalized local schedule configuration (aliases: list, show)"},
+			{"ensure", "ensure appointment and hours calendars/events exist"},
+		},
+		Flags:    scheduleHelpFlags(),
+		Output:   []string{"stdout: YAML schedule config or ensure result.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap hours json", "jmap hours ensure --hours-calendar hours"},
+		SeeAlso:  []string{"jmap schemas"},
+	})
+
+	add("slot", helpTopic{
+		Summary: "jmap slot - find availability slots and appointment conflicts",
+		Usage:   []string{"jmap [global flags] slot <list|date|busy|within-hours|conflicts> [schedule flags] [args]"},
+		Commands: []helpItem{
+			{"list", "list available slots over a range"},
+			{"date", "list available slots for one local date (alias: for-date)"},
+			{"busy", "report whether a requested range is busy"},
+			{"within-hours", "report whether a range is within business hours"},
+			{"conflicts", "list conflicting appointment events"},
+		},
+		Flags:    scheduleHelpFlags(),
+		Output:   []string{"stdout: YAML slot list, boolean result, or conflict list.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap slot list --from 2026-01-05T00:00:00Z --to 2026-01-06T00:00:00Z --duration 30m"},
+		SeeAlso:  []string{"jmap help slot list", "jmap schemas"},
+	})
+	add("slot list", helpTopic{
+		Summary: "jmap slot list - list available appointment slots over a range",
+		Usage:   []string{"jmap [global flags] slot list [schedule flags] --from RFC3339 --to RFC3339 [--duration DURATION]"},
+		Flags: append(scheduleHelpFlags(), []helpItem{
+			{"--from RFC3339", "range start"},
+			{"--to RFC3339", "range end"},
+			{"--duration DURATION", "slot duration (default: 30m)"},
+		}...),
+		Output:   []string{"stdout: YAML available slot list.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap slot list --from 2026-01-05T00:00:00Z --to 2026-01-06T00:00:00Z --duration 30m"},
+		SeeAlso:  []string{"jmap help slot", "jmap schemas"},
+	})
+
+	add("appointment", helpTopic{
+		Summary: "jmap appointment - manage appointment state and booking helpers",
+		Usage:   []string{"jmap [global flags] appointment <services|create|list|get|cancel|dates|times|next|query-exact|waiting-list|notification> [args]"},
+		Commands: []helpItem{
+			{"services", "list built-in services"},
+			{"create", "book an appointment and persist local metadata"},
+			{"list", "list local appointment records"},
+			{"get", "read one local appointment by event id"},
+			{"cancel", "delete the JMAP event for an appointment"},
+			{"dates|times|next", "compute local availability helper results"},
+			{"query-exact", "check requested local date/time choices and alternates"},
+			{"waiting-list", "persist a waiting-list request"},
+			{"notification", "manage appointment notification markers"},
+		},
+		Output:   []string{"stdout: YAML appointment result, list, local state update, or availability helper result.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap appointment services", "jmap appointment create --contact-id contact-1 --start 2026-01-05T15:00:00Z --service service2"},
+		SeeAlso:  []string{"jmap help appointment create", "jmap help appointment notification", "jmap schemas"},
+	})
+	add("appointment create", helpTopic{
+		Summary: "jmap appointment create - book one appointment and persist metadata",
+		Usage:   []string{"jmap [global flags] appointment create [schedule flags] --contact-id ID --start RFC3339 --service NAME [--contact-name NAME] [--title TITLE] [--duration DURATION] [--calendar-id ID]"},
+		Flags: append(scheduleHelpFlags(), []helpItem{
+			{"--contact-id ID", "contact id for the appointment"},
+			{"--contact-name NAME", "contact display name stored in local metadata"},
+			{"--title TITLE", "event title (default: derived from contact/service)"},
+			{"--start RFC3339", "appointment start time"},
+			{"--duration DURATION", "override selected service duration"},
+			{"--calendar-id ID", "appointment calendar id override"},
+			{"--service NAME", "service name; repeatable"},
+		}...),
+		Output:   []string{"stdout: YAML booking result and persisted appointment metadata, or dry-run preview.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap appointment create --contact-id contact-1 --start 2026-01-05T15:00:00Z --service service2"},
+		SeeAlso:  []string{"jmap help appointment", "jmap schemas"},
+	})
+	add("appointment notification", helpTopic{
+		Summary: "jmap appointment notification - manage appointment notification markers",
+		Usage:   []string{"jmap [global flags] appointment notification <mark-sent|mark-failed|notify-due|list> [args]"},
+		Commands: []helpItem{
+			{"mark-sent", "mark one appointment event notification as sent"},
+			{"mark-failed", "mark one notification as failed with optional error text"},
+			{"notify-due", "list notifications due within a duration window"},
+			{"list", "list stored notification markers"},
+		},
+		Flags: []helpItem{
+			{"--event-id ID", "event id for mark-failed (or first positional arg)"},
+			{"--error TEXT", "failure message for mark-failed"},
+			{"--within DURATION", "due window for notify-due (default: 24h)"},
+		},
+		Output:   []string{"stdout: YAML local notification marker result or list.", "stderr: coded YAML error envelope."},
+		Examples: []string{"jmap appointment notification mark-sent event-1", "jmap appointment notification notify-due --within 48h"},
+		SeeAlso:  []string{"jmap help appointment", "jmap schemas"},
+	})
+
+	add("schemas", helpTopic{
+		Summary:  "jmap schemas - list structured output schema IDs and paths",
+		Usage:    []string{"jmap schemas"},
+		Output:   []string{"stdout: structured YAML schema discovery document.", "stderr: coded YAML error envelope only if discovery fails."},
+		Examples: []string{"jmap schemas"},
+		SeeAlso:  []string{"go/CLI_SPEC.md"},
+	})
+
+	return topics
 }

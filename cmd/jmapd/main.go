@@ -9,25 +9,37 @@ import (
 	"syscall"
 )
 
-const jmapdHelp = `jmapd - bridge JMAP calendar VALARMs to an opencode agent
+const jmapdHelp = `jmapd - bridge JMAP calendar VALARMs, inbound mail, and shared contacts to an opencode agent
 
-Usage:
+USAGE
   jmapd
   jmapd --help
+  jmapd help
 
-Required environment:
-  JMAP_BASE_URL            JMAP server base URL
-  JMAP_USER                JMAP account user identifier
-  JMAP_PASS                JMAP account password
-  OPENCODE_BASE_URL        opencode API base URL (or OPENCODE_PORT)
-  OPENCODE_DIRECTORY       opencode working directory
-  OPENCODE_AGENT           opencode agent ID (or AGENT_ID)
-  JMAPD_STATE_DIR          directory for events.json, sessions.json, status.json
+ENVIRONMENT
+  JMAP_BASE_URL or JMAP_URL          JMAP server base URL
+  JMAP_USER                         JMAP account user identifier
+  JMAP_PASS or JMAP_PASSWORD        JMAP account password
+  OPENCODE_BASE_URL or OPENCODE_URL opencode API base URL
+  OPENCODE_PORT                     opencode API port when base URL is unset
+  OPENCODE_HOST                     host used with OPENCODE_PORT (default: 127.0.0.1)
+  OPENCODE_DIRECTORY or OPENCODE_DIR opencode working directory
+  OPENCODE_AGENT or AGENT_ID        opencode agent ID
+  JMAPD_STATE_DIR or STATE_DIR      directory for events.json, sessions.json, status.json
+  JMAP_POLL_INTERVAL                polling fallback interval (default: 60s)
+  JMAP_ALARM_WINDOW                 VALARM expansion window (default: 168h)
+  OPENCODE_PROMPT_TIMEOUT           prompt timeout (default: no timeout)
 
-Optional environment:
-  JMAP_POLL_INTERVAL       polling fallback interval as a Go duration (default 60s)
-  JMAP_ALARM_WINDOW        VALARM expansion window as a Go duration (default 168h)
-  OPENCODE_PROMPT_TIMEOUT  prompt timeout as a Go duration
+OUTPUT
+  stdout: explicit help writes only this help text.
+  stderr: runtime logs, fatal errors, and configuration errors.
+  state: events.json, sessions.json, and status.json persist under JMAPD_STATE_DIR.
+
+EXAMPLES
+  jmapd --help
+  JMAP_BASE_URL=https://jmap.example.com JMAP_USER=user@example.com JMAP_PASS=replace-me \
+    OPENCODE_BASE_URL=http://127.0.0.1:4096 OPENCODE_DIRECTORY=/data/opencode/work \
+    OPENCODE_AGENT=agent_123 JMAPD_STATE_DIR=/data/opencode/state/jmapd jmapd
 `
 
 func main() {

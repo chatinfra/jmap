@@ -29,18 +29,168 @@ func TestJSONFlagRejectedWithYAMLError(t *testing.T) {
 	}
 }
 
-func TestHelpOutput(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	if err := Run([]string{"help"}, &stdout, &stderr); err != nil {
-		t.Fatal(err)
+func TestRootHelpHasHumanReadableSections(t *testing.T) {
+	baselineStdout, baselineStderr, err := runCLI(t)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
-	requireYAMLStdout(t, stdout.String(), stderr.String(), "help.schema.yaml")
-	stdout.Reset()
-	stderr.Reset()
-	if err := Run([]string{"schemas"}, &stdout, &stderr); err != nil {
-		t.Fatal(err)
+	if baselineStderr != "" {
+		t.Fatalf("stderr = %q; want empty stderr", baselineStderr)
 	}
-	requireYAMLStdout(t, stdout.String(), stderr.String(), "schemas.schema.yaml")
+
+	for _, args := range [][]string{{"help"}, {"--help"}, {"-h"}} {
+		stdout, stderr, err := runCLI(t, args...)
+		if err != nil {
+			t.Fatalf("Run(%v) error = %v", args, err)
+		}
+		if stderr != "" {
+			t.Fatalf("Run(%v) stderr = %q; want empty stderr", args, stderr)
+		}
+		if stdout != baselineStdout {
+			t.Fatalf("Run(%v) stdout differs from bare help\n--- bare ---\n%s\n--- got ---\n%s", args, baselineStdout, stdout)
+		}
+	}
+
+	for _, want := range []string{"USAGE", "COMMANDS", "FLAGS", "OUTPUT", "EXAMPLES", "SEE ALSO"} {
+		if !strings.Contains(baselineStdout, "\n"+want+"\n") {
+			t.Fatalf("root help missing section %q:\n%s", want, baselineStdout)
+		}
+	}
+	for _, forbidden := range []string{"\ncommands:\n", "\nflags:\n", "\nschemas:\n"} {
+		if strings.Contains(baselineStdout, forbidden) {
+			t.Fatalf("root help still looks like YAML discovery; contains %q:\n%s", forbidden, baselineStdout)
+		}
+	}
+}
+
+func TestRootHelpListsCommandsDefaultsAndSchemasPointer(t *testing.T) {
+	stdout, stderr, err := runCLI(t, "help")
+	if err != nil {
+		t.Fatalf("Run(help) error = %v", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q; want empty stderr", stderr)
+	}
+
+	for _, command := range []string{"check", "raw", "calendar", "event", "availability", "principal", "participant", "addressbook", "contact", "mailbox", "message", "hours", "slot", "appointment", "schemas"} {
+		if !strings.Contains(stdout, "\n  "+command) {
+			t.Fatalf("root help missing command %q:\n%s", command, stdout)
+		}
+	}
+	for _, want := range []string{"--url URL", "JMAP_URL", "--user USER", "JMAP_USER", "--password PASS", "JMAP_PASSWORD", "--timeout DURATION", "JMAP_TIMEOUT", "--trace", "JMAP_TRACE", "--state-root DIR", "JMAP_STATE_ROOT", "--dry-run", "JMAP_DRY_RUN", "--force", "JMAP_FORCE"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("root help missing %q:\n%s", want, stdout)
+		}
+	}
+	for _, want := range []string{"stdout:", "stderr:", "jmap schemas"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("root help missing output/discovery text %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestCommandHelpDoesNotRequireConfig(t *testing.T) {
+	clearJMAPEnv(t)
+	for _, args := range [][]string{
+		{"help", "calendar"},
+		{"help", "calendar", "create"},
+		{"help", "raw", "call"},
+		{"event", "query", "--help"},
+		{"contact", "create", "--help"},
+		{"message", "create", "-h"},
+		{"slot", "list", "--help"},
+		{"appointment", "create", "--help"},
+		{"appointment", "notification", "--help"},
+	} {
+		stdout, stderr, err := runCLI(t, args...)
+		if err != nil {
+			t.Fatalf("Run(%v) error = %v stderr=%s", args, err, stderr)
+		}
+		if stderr != "" {
+			t.Fatalf("Run(%v) stderr = %q; want empty stderr", args, stderr)
+		}
+		for _, want := range []string{"USAGE", "OUTPUT", "EXAMPLES"} {
+			if !strings.Contains(stdout, "\n"+want+"\n") {
+				t.Fatalf("Run(%v) help missing %s:\n%s", args, want, stdout)
+			}
+		}
+		if strings.Contains(stdout, "missing required configuration") || strings.Contains(stderr, "missing_config") {
+			t.Fatalf("Run(%v) attempted configuration-dependent execution stdout=%q stderr=%q", args, stdout, stderr)
+		}
+	}
+}
+
+func TestCommandHelpPluralAliasesAndHelpForms(t *testing.T) {
+	clearJMAPEnv(t)
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"calendars", "--help"}, want: "jmap calendar -"},
+		{args: []string{"events", "-h"}, want: "jmap event -"},
+		{args: []string{"contacts", "--help"}, want: "jmap contact -"},
+		{args: []string{"mailboxes", "--help"}, want: "jmap mailbox -"},
+		{args: []string{"messages", "--help"}, want: "jmap message -"},
+		{args: []string{"slots", "--help"}, want: "jmap slot -"},
+		{args: []string{"appointments", "--help"}, want: "jmap appointment -"},
+	} {
+		stdout, stderr, err := runCLI(t, tc.args...)
+		if err != nil {
+			t.Fatalf("Run(%v) error = %v stderr=%s", tc.args, err, stderr)
+		}
+		if stderr != "" {
+			t.Fatalf("Run(%v) stderr = %q; want empty stderr", tc.args, stderr)
+		}
+		if !strings.Contains(stdout, tc.want) {
+			t.Fatalf("Run(%v) stdout missing %q:\n%s", tc.args, tc.want, stdout)
+		}
+	}
+}
+
+func TestUnknownHelpTopicUsesYAMLErrorEnvelope(t *testing.T) {
+	stdout, stderr, err := runCLI(t, "help", "bogus")
+	if err == nil {
+		t.Fatal("expected unknown help topic error")
+	}
+	doc := requireYAMLError(t, stdout, stderr, "error.schema.yaml")
+	envelope := doc.(map[string]any)["error"].(map[string]any)
+	if envelope["code"] != "unknown_help_topic" {
+		t.Fatalf("error envelope = %#v", envelope)
+	}
+	message, _ := envelope["message"].(string)
+	if !strings.Contains(message, "jmap help") {
+		t.Fatalf("error message missing jmap help hint: %#v", envelope)
+	}
+}
+
+func TestSchemasCommandRemainsStructuredDiscovery(t *testing.T) {
+	stdout, stderr, err := runCLI(t, "schemas")
+	if err != nil {
+		t.Fatalf("Run(schemas) error = %v", err)
+	}
+	doc := requireYAMLStdout(t, stdout, stderr, "schemas.schema.yaml").(map[string]any)
+	schemas, ok := doc["schemas"].([]any)
+	if !ok {
+		t.Fatalf("schemas payload = %#v", doc)
+	}
+	ids := map[string]bool{}
+	for _, item := range schemas {
+		schema, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("schema item = %#v", item)
+		}
+		id, _ := schema["id"].(string)
+		ids[id] = true
+	}
+	requireSchemaDiscoveryPaths(t, doc)
+	for _, want := range []string{"schemas", "error", "check", "raw", "calendar", "event", "availability", "principal", "participant", "addressbook", "contact", "mailbox", "message", "hours", "slot", "appointment"} {
+		if !ids[want] {
+			t.Fatalf("schemas discovery missing id %q: %#v", want, ids)
+		}
+	}
+	if ids["help"] {
+		t.Fatalf("schemas discovery advertises legacy default-help schema: %#v", ids)
+	}
 }
 
 func TestYAMLErrorEnvelopeForMissingConfig(t *testing.T) {
@@ -150,6 +300,20 @@ func TestAppointmentWaitingListUsesStateRoot(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("state files = %d, want 1", len(entries))
+	}
+}
+
+func runCLI(t *testing.T, args ...string) (string, string, error) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	err := Run(args, &stdout, &stderr)
+	return stdout.String(), stderr.String(), err
+}
+
+func clearJMAPEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{"JMAP_URL", "JMAP_USER", "JMAP_PASSWORD", "JMAP_TIMEOUT", "JMAP_TRACE", "JMAP_STATE_ROOT", "JMAP_DRY_RUN", "JMAP_FORCE"} {
+		t.Setenv(name, "")
 	}
 }
 

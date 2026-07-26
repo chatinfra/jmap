@@ -176,9 +176,12 @@ func decodeEvent(data []byte) (opencodeEvent, bool, error) {
 	if err := json.Unmarshal(data, &obj); err != nil {
 		return opencodeEvent{}, false, fmt.Errorf("decode opencode event: %w", err)
 	}
-	if nested, ok := objectValue(obj["data"]); ok {
-		if _, hasType := obj["type"]; !hasType {
-			obj = nested
+	if _, hasType := obj["type"]; !hasType {
+		for _, key := range []string{"payload", "data"} {
+			if nested, ok := objectValue(obj[key]); ok {
+				obj = nested
+				break
+			}
 		}
 	}
 	typeValue, _ := stringValue(obj["type"])

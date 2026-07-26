@@ -116,6 +116,16 @@ func TestProbePushReportsAvailability(t *testing.T) {
 	}
 }
 
+func TestCalendarDecodeToleratesCyrusStringAvailability(t *testing.T) {
+	var calendar Calendar
+	if err := json.Unmarshal([]byte(`{"id":"cal-1","name":"Work","isVisible":"true","includeInAvailability":"freeBusy"}`), &calendar); err != nil {
+		t.Fatalf("unmarshal calendar: %v", err)
+	}
+	if calendar.ID != "cal-1" || !bool(calendar.IsVisible) || bool(calendar.IncludeInAvailability) {
+		t.Fatalf("calendar=%+v", calendar)
+	}
+}
+
 func TestVALARMParsingCoversAbsoluteRelativeAndMalformed(t *testing.T) {
 	event := Event{ID: "evt-1", UID: "uid-1", Title: "Review", ICalendar: "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:uid-1\nSUMMARY:Project review\nDTSTART:20260521T140000Z\nDTEND:20260521T150000Z\nLOCATION:Zoom\nATTENDEE;CN=Jo:mailto:jo@example.com\nBEGIN:VALARM\nACTION:DISPLAY\nTRIGGER:20260521T130000Z\nEND:VALARM\nBEGIN:VALARM\nACTION:EMAIL\nTRIGGER:-PT10M\nEND:VALARM\nBEGIN:VALARM\nACTION:AUDIO\nTRIGGER;RELATED=END:-PT5M\nEND:VALARM\nBEGIN:VALARM\nACTION:DISPLAY\nTRIGGER:bogus\nEND:VALARM\nEND:VEVENT\nEND:VCALENDAR"}
 	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
