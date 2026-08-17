@@ -52,7 +52,7 @@ jmap raw call Calendar/get --params '{"ids":null}' --capability urn:ietf:params:
 
 ## `jmapd` bridge daemon
 
-`cmd/jmapd` runs one long-lived bridge for one JMAP-attached agent. It watches the account's calendars and events, schedules local wall-clock VALARM fires, handles inbound mail and shared-contact access, and submits formatted prompts to the local OpenCode API. It never writes a response back to JMAP.
+`cmd/jmapd` runs one long-lived bridge for one JMAP-attached agent. It watches the account's calendars and events, schedules local wall-clock VALARM fires, handles inbound mail and shared-contact access, and submits formatted prompts to the local OpenCode API. Mail sender resolution is read-only; shared-contact creation is limited to the explicit on-demand lookup-or-provision capability. It never writes a response or any automatic-mail state back to JMAP.
 
 Required environment:
 
@@ -66,12 +66,12 @@ Required environment:
 | `OPENCODE_HOST` | Host used with `OPENCODE_PORT` (default `127.0.0.1`) |
 | `OPENCODE_DIRECTORY` or `OPENCODE_DIR` | OpenCode working directory |
 | `OPENCODE_AGENT` or `AGENT_ID` | OpenCode agent ID |
-| `JMAPD_STATE_DIR` or `STATE_DIR` | Directory for `events.json`, `sessions.json`, `status.json` |
+| `JMAPD_STATE_DIR` or `STATE_DIR` | Directory for `events.json`, `sessions.json`, `messages.json`, `contacts.json`, and `status.json` |
 | `JMAP_POLL_INTERVAL` | Polling fallback interval (default `60s`) |
 | `JMAP_ALARM_WINDOW` | VALARM expansion window (default `168h`) |
 | `OPENCODE_PROMPT_TIMEOUT` | Prompt timeout (default: no timeout) |
 
-`jmapd` writes its runtime state as three files under `JMAPD_STATE_DIR`: `events.json` (last calendar/event snapshot), `sessions.json` (calendar id to OpenCode session map, preserved across restarts), and `status.json` (the health contract read by ChatInfra: connection flag, push/polling state, last refresh, last VALARM fire, last completed prompt, latest error, session count, start time, and registered listener keys).
+`jmapd` writes its runtime state under `JMAPD_STATE_DIR`: `events.json` (last calendar/event snapshot), `sessions.json` (calendar and mailbox to OpenCode session map, preserved across restarts), `messages.json` (the persisted observed-message set used for first-run baselining and restart deduplication), `contacts.json` (the warm shared-contact read-model cache), and `status.json` (the health contract read by ChatInfra: connection flag, push/polling state, last refresh, last VALARM fire, last inbound mail, last contact refresh, last completed prompt, latest error, session counts, start time, and registered listener keys). These files are local runtime state, not company-definition or current-availability evidence; see the repository's [specification authority](../../doc/tooling/specification-authority.md).
 
 Prompt errors, stale-session recreation failures, timeouts, and missing assistant responses are log-only: `jmapd` records them in `status.json`, takes no JMAP-side action, and continues processing later VALARMs. Fatal JMAP connection errors exit non-zero so the supervising user-systemd unit restarts the daemon.
 
